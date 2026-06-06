@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 from pathlib import Path
 
@@ -16,10 +17,11 @@ from app.integrations.feishu.client import FeishuClient
 from app.integrations.feishu.events import extract_file_message
 from app.services.document_parser import parse_document
 from app.services.financial_summary import generate_financial_summary_markdown
-from app.services.llm_provider import LLMConfig, LLMProvider
+from app.services.llm_provider import LLMConfig, LLMProvider, TokenUsage
 from app.services.markdown_report import build_parse_preview_report
 
 logger = logging.getLogger(__name__)
+REPORT_TEXT_MAX_CHARS = 3500
 
 
 def format_model_info(settings: Settings) -> str:
@@ -42,6 +44,58 @@ def build_ack_message(settings: Settings, file_name: str | None) -> str:
     )
 
 
+def format_token_usage(usage: TokenUsage) -> str:
+    return "\n".join(
+        [
+            "## Token 使用量",
+            f"- Input tokens：{usage.input_tokens:,}",
+            f"- Output tokens：{usage.output_tokens:,}",
+            f"- Total tokens：{usage.total_tokens:,}",
+        ]
+    )
+
+
+def build_report_file_path(storage_dir: Path, source_file_name: str, report: str) -> Path:
+    stem = Path(source_file_name).stem or "report"
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._") or "report"
+    report_path = storage_dir / f"{safe_stem}_financial_summary.md"
+    report_path.write_text(report, encoding="utf-8")
+    return report_path
+
+
+async def send_report_result(
+    client: FeishuClient,
+    message_id: str,
+    storage_dir: Path,
+    source_file_name: str,
+    report: str,
+    usage: TokenUsage,
+) -> None:
+    usage_text = format_token_usage(usage)
+    report_with_usage = report + "\n\n---\n\n" + usage_text
+    if len(report_with_usage) <= REPORT_TEXT_MAX_CHARS:
+        await client.reply_text(
+            message_id,
+            "分析完成，报告如下：\n\n" + report_with_usage,
+        )
+        return
+
+    report_path = build_report_file_path(storage_dir, source_file_name, report_with_usage)
+    await client.reply_text(
+        message_id,
+        "\n".join(
+            [
+                "分析完成，报告较长，已生成 Markdown 附件。",
+                "",
+                f"- 文件：{report_path.name}",
+                "",
+                usage_text,
+            ]
+        ),
+    )
+    await client.reply_file(message_id, report_path, file_name=report_path.name)
+
+
 async def process_file_message_async(
     settings: Settings,
     message_id: str,
@@ -50,7 +104,8 @@ async def process_file_message_async(
 ) -> None:
     client = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
     safe_name = file_name or "uploaded-file"
-    target_path = Path(settings.local_storage_dir) / message_id / safe_name
+    storage_dir = Path(settings.local_storage_dir) / message_id
+    target_path = storage_dir / safe_name
 
     async def notify(text: str) -> None:
         await client.reply_text(message_id, text)
@@ -80,6 +135,21 @@ async def process_file_message_async(
             f"文本提取完成：{page_info} 页，约 {char_count:,} 字符。"
             f"文件类型：{document.file_type}。"
         )
+        if not document.text.strip():
+            await notify(
+                "\n".join(
+                    [
+                        "处理停止：未能从 PDF 中提取到可复制文本。",
+                        "",
+                        f"- 文件：{downloaded_path.name}",
+                        f"- 页数：{page_info}",
+                        "- 原因：该文件很可能是扫描件或图片型 PDF，当前 MVP 暂未接入 OCR。",
+                        "",
+                        "建议：请上传带文本层的 PDF，或先将扫描件转换为可搜索 PDF 后重试。",
+                    ]
+                )
+            )
+            return
 
         if settings.llm_api_key:
             provider = LLMProvider(
@@ -97,18 +167,28 @@ async def process_file_message_async(
                 f"开始调用模型 {settings.llm_model} 分析"
                 f"（最多 {settings.llm_max_chunks} 个片段）..."
             )
-            report = await generate_financial_summary_markdown(
+            summary_result = await generate_financial_summary_markdown(
                 document=document,
                 provider=provider,
                 chunk_chars=settings.llm_chunk_chars,
                 max_chunks=settings.llm_max_chunks,
                 on_progress=notify,
             )
+            report = summary_result.markdown
+            usage = summary_result.usage
         else:
             await notify("未配置 LLM_API_KEY，返回解析预览。")
             report = build_parse_preview_report(document)
+            usage = TokenUsage()
 
-        await notify("分析完成，报告如下：\n\n" + report)
+        await send_report_result(
+            client=client,
+            message_id=message_id,
+            storage_dir=storage_dir,
+            source_file_name=safe_name,
+            report=report,
+            usage=usage,
+        )
     except httpx.ReadTimeout:
         logger.exception("LLM timeout while processing file message %s", message_id)
         await notify(

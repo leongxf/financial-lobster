@@ -49,6 +49,59 @@ class FeishuClient:
             )
             response.raise_for_status()
 
+    async def reply_file(
+        self,
+        message_id: str,
+        file_path: Path,
+        file_name: str | None = None,
+        file_type: str = "stream",
+    ) -> None:
+        file_key = await self.upload_file(
+            file_path=file_path,
+            file_name=file_name or file_path.name,
+            file_type=file_type,
+        )
+        await self._reply_file_once(message_id, file_key)
+
+    async def upload_file(
+        self,
+        file_path: Path,
+        file_name: str,
+        file_type: str = "stream",
+    ) -> str:
+        token = await self.get_tenant_access_token()
+        with file_path.open("rb") as file:
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.post(
+                    f"{self.base_url}/im/v1/files",
+                    headers={"Authorization": f"Bearer {token}"},
+                    data={
+                        "file_type": file_type,
+                        "file_name": file_name,
+                    },
+                    files={"file": (file_name, file)},
+                )
+                response.raise_for_status()
+
+        data = response.json()
+        file_key = (data.get("data") or {}).get("file_key")
+        if not file_key:
+            raise RuntimeError(f"failed to upload report file: {data}")
+        return file_key
+
+    async def _reply_file_once(self, message_id: str, file_key: str) -> None:
+        token = await self.get_tenant_access_token()
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                f"{self.base_url}/im/v1/messages/{message_id}/reply",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "msg_type": "file",
+                    "content": json.dumps({"file_key": file_key}, ensure_ascii=False),
+                },
+            )
+            response.raise_for_status()
+
     async def download_message_file(
         self,
         message_id: str,

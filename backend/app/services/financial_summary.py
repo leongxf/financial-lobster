@@ -2,7 +2,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from app.services.document_parser import ParsedDocument, ParsedPage
-from app.services.llm_provider import LLMProvider
+from app.services.llm_provider import LLMProvider, TokenUsage
 
 ProgressCallback = Callable[[str], Awaitable[None]] | None
 
@@ -13,6 +13,12 @@ class TextChunk:
     start_page: int
     end_page: int
     text: str
+
+
+@dataclass(frozen=True)
+class FinancialSummaryResult:
+    markdown: str
+    usage: TokenUsage
 
 
 SYSTEM_PROMPT = """你是服务于四大投资建议/交易咨询人员的材料分析助理。
@@ -72,27 +78,37 @@ async def generate_financial_summary_markdown(
     chunk_chars: int,
     max_chunks: int,
     on_progress: ProgressCallback = None,
-) -> str:
+) -> FinancialSummaryResult:
     chunks = build_chunks(document.pages, chunk_chars=chunk_chars, max_chunks=max_chunks)
     if not chunks:
-        return _empty_text_report(document)
+        return FinancialSummaryResult(
+            markdown=_empty_text_report(document),
+            usage=TokenUsage(),
+        )
 
     chunk_notes: list[str] = []
+    usage = TokenUsage()
     total = len(chunks)
     for chunk in chunks:
         if on_progress:
             await on_progress(
                 f"正在分析片段 {chunk.index}/{total}（第 {chunk.start_page}-{chunk.end_page} 页）..."
             )
-        chunk_notes.append(await summarize_chunk(chunk, provider))
+        chunk_result = await summarize_chunk(chunk, provider)
+        chunk_notes.append(chunk_result.markdown)
+        usage += chunk_result.usage
 
     if on_progress:
         await on_progress("正在合成最终 Markdown 报告...")
 
-    return await synthesize_final_report(document, chunk_notes, provider, len(chunks))
+    final_result = await synthesize_final_report(document, chunk_notes, provider, len(chunks))
+    return FinancialSummaryResult(
+        markdown=final_result.markdown,
+        usage=usage + final_result.usage,
+    )
 
 
-async def summarize_chunk(chunk: TextChunk, provider: LLMProvider) -> str:
+async def summarize_chunk(chunk: TextChunk, provider: LLMProvider) -> FinancialSummaryResult:
     user_prompt = f"""请整理以下材料片段中的客观财务/经营信息。
 
 片段范围：第 {chunk.start_page} 页至第 {chunk.end_page} 页
@@ -106,12 +122,13 @@ async def summarize_chunk(chunk: TextChunk, provider: LLMProvider) -> str:
 材料片段：
 {chunk.text}
 """
-    return await provider.complete(
+    result = await provider.complete(
         [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
     )
+    return FinancialSummaryResult(markdown=result.content, usage=result.usage)
 
 
 async def synthesize_final_report(
@@ -119,7 +136,7 @@ async def synthesize_final_report(
     chunk_notes: list[str],
     provider: LLMProvider,
     chunk_count: int,
-) -> str:
+) -> FinancialSummaryResult:
     notes = "\n\n---\n\n".join(
         f"## 片段 {index + 1} 整理结果\n{note}" for index, note in enumerate(chunk_notes)
     )
@@ -148,12 +165,13 @@ async def synthesize_final_report(
 分片整理结果：
 {notes}
 """
-    return await provider.complete(
+    result = await provider.complete(
         [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
     )
+    return FinancialSummaryResult(markdown=result.content, usage=result.usage)
 
 
 def _empty_text_report(document: ParsedDocument) -> str:

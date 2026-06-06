@@ -1,6 +1,6 @@
-from dataclasses import dataclass
 import asyncio
 import logging
+from dataclasses import dataclass
 
 import httpx
 
@@ -18,11 +18,35 @@ class LLMConfig:
     temperature: float
 
 
+@dataclass(frozen=True)
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+
+    def __add__(self, other: "TokenUsage") -> "TokenUsage":
+        return TokenUsage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+        )
+
+
+@dataclass(frozen=True)
+class LLMResult:
+    content: str
+    usage: TokenUsage
+
+
 class LLMProvider:
     def __init__(self, config: LLMConfig) -> None:
         self.config = config
 
-    async def complete(self, messages: list[dict[str, str]], max_retries: int = 2) -> str:
+    async def complete(
+        self,
+        messages: list[dict[str, str]],
+        max_retries: int = 2,
+    ) -> LLMResult:
         if not self.config.api_key:
             raise RuntimeError("LLM_API_KEY is required")
 
@@ -73,4 +97,34 @@ class LLMProvider:
         if not content:
             raise RuntimeError(f"LLM response has no content: {data}")
 
-        return content
+        return LLMResult(content=content, usage=_parse_usage(data.get("usage") or {}))
+
+
+def _parse_usage(raw_usage: dict) -> TokenUsage:
+    input_tokens = _as_int(
+        raw_usage.get("prompt_tokens")
+        or raw_usage.get("input_tokens")
+        or raw_usage.get("input_token")
+    )
+    output_tokens = _as_int(
+        raw_usage.get("completion_tokens")
+        or raw_usage.get("output_tokens")
+        or raw_usage.get("output_token")
+    )
+    total_tokens = _as_int(raw_usage.get("total_tokens"))
+    if not total_tokens:
+        total_tokens = input_tokens + output_tokens
+
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+def _as_int(value: object) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return 0
