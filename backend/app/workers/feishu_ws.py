@@ -15,10 +15,12 @@ from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.integrations.feishu.client import FeishuClient
 from app.integrations.feishu.events import extract_file_message
+from app.services.analysis_cache import AnalysisCache, sha256_file
 from app.services.document_parser import parse_document
 from app.services.financial_summary import generate_financial_summary_markdown
 from app.services.llm_provider import LLMConfig, LLMProvider, TokenUsage
 from app.services.markdown_report import build_parse_preview_report
+from app.services.task_store import TaskStore
 
 logger = logging.getLogger(__name__)
 REPORT_TEXT_MAX_CHARS = 3500
@@ -44,13 +46,19 @@ def build_ack_message(settings: Settings, file_name: str | None) -> str:
     )
 
 
-def format_token_usage(usage: TokenUsage) -> str:
+def format_token_usage(
+    usage: TokenUsage,
+    *,
+    cache_hits: int = 0,
+    cache_misses: int = 0,
+) -> str:
     return "\n".join(
         [
             "## Token 使用量",
             f"- Input tokens：{usage.input_tokens:,}",
             f"- Output tokens：{usage.output_tokens:,}",
             f"- Total tokens：{usage.total_tokens:,}",
+            f"- 分片缓存：命中 {cache_hits}，未命中 {cache_misses}",
         ]
     )
 
@@ -70,17 +78,23 @@ async def send_report_result(
     source_file_name: str,
     report: str,
     usage: TokenUsage,
-) -> None:
-    usage_text = format_token_usage(usage)
+    cache_hits: int = 0,
+    cache_misses: int = 0,
+) -> Path:
+    usage_text = format_token_usage(
+        usage,
+        cache_hits=cache_hits,
+        cache_misses=cache_misses,
+    )
     report_with_usage = report + "\n\n---\n\n" + usage_text
+    report_path = build_report_file_path(storage_dir, source_file_name, report_with_usage)
     if len(report_with_usage) <= REPORT_TEXT_MAX_CHARS:
         await client.reply_text(
             message_id,
             "分析完成，报告如下：\n\n" + report_with_usage,
         )
-        return
+        return report_path
 
-    report_path = build_report_file_path(storage_dir, source_file_name, report_with_usage)
     await client.reply_text(
         message_id,
         "\n".join(
@@ -94,6 +108,7 @@ async def send_report_result(
         ),
     )
     await client.reply_file(message_id, report_path, file_name=report_path.name)
+    return report_path
 
 
 async def process_file_message_async(
@@ -102,7 +117,10 @@ async def process_file_message_async(
     file_key: str,
     file_name: str | None,
 ) -> None:
+    task_id = message_id
     client = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
+    task_store = TaskStore(settings.task_storage_dir)
+    analysis_cache = AnalysisCache(settings.analysis_cache_dir)
     safe_name = file_name or "uploaded-file"
     storage_dir = Path(settings.local_storage_dir) / message_id
     target_path = storage_dir / safe_name
@@ -111,8 +129,17 @@ async def process_file_message_async(
         await client.reply_text(message_id, text)
 
     try:
+        task_store.create_task(
+            task_id,
+            message_id=message_id,
+            file_key=file_key,
+            file_name=file_name,
+            model=settings.llm_model,
+            provider=settings.llm_provider,
+        )
         await notify(build_ack_message(settings, file_name))
 
+        task_store.update_task(task_id, status="downloading", event="downloading file")
         downloaded_path = await client.download_message_file(
             message_id,
             file_key,
@@ -126,16 +153,42 @@ async def process_file_message_async(
                 "local_path": str(downloaded_path),
             },
         )
+        file_hash = sha256_file(downloaded_path)
+        task_store.update_task(
+            task_id,
+            status="downloaded",
+            event="file downloaded",
+            local_file_path=str(downloaded_path),
+            file_hash=file_hash,
+        )
         await notify(f"文件下载完成：{downloaded_path.name}")
 
+        task_store.update_task(task_id, status="parsing", event="extracting text")
         document = parse_document(downloaded_path)
         char_count = len(document.text)
         page_info = document.page_count if document.page_count is not None else "未知"
+        extracted_text_path = storage_dir / "extracted_text.txt"
+        extracted_text_path.write_text(document.text, encoding="utf-8")
+        task_store.update_task(
+            task_id,
+            status="parsed",
+            event="text extracted",
+            file_type=document.file_type,
+            page_count=document.page_count,
+            extracted_text_chars=char_count,
+            extracted_text_path=str(extracted_text_path),
+        )
         await notify(
             f"文本提取完成：{page_info} 页，约 {char_count:,} 字符。"
             f"文件类型：{document.file_type}。"
         )
         if not document.text.strip():
+            task_store.update_task(
+                task_id,
+                status="failed",
+                event="no extractable text",
+                error="PDF has no extractable text layer",
+            )
             await notify(
                 "\n".join(
                     [
@@ -151,6 +204,8 @@ async def process_file_message_async(
             )
             return
 
+        cache_hits = 0
+        cache_misses = 0
         if settings.llm_api_key:
             provider = LLMProvider(
                 LLMConfig(
@@ -163,6 +218,14 @@ async def process_file_message_async(
                     temperature=settings.llm_temperature,
                 )
             )
+            task_store.update_task(
+                task_id,
+                status="analyzing",
+                event="calling LLM",
+                prompt_version=settings.prompt_version,
+                llm_chunk_chars=settings.llm_chunk_chars,
+                llm_max_chunks=settings.llm_max_chunks,
+            )
             await notify(
                 f"开始调用模型 {settings.llm_model} 分析"
                 f"（最多 {settings.llm_max_chunks} 个片段）..."
@@ -172,25 +235,55 @@ async def process_file_message_async(
                 provider=provider,
                 chunk_chars=settings.llm_chunk_chars,
                 max_chunks=settings.llm_max_chunks,
+                prompt_version=settings.prompt_version,
+                file_hash=file_hash,
+                cache=analysis_cache,
                 on_progress=notify,
             )
             report = summary_result.markdown
             usage = summary_result.usage
+            cache_hits = summary_result.cache_hits
+            cache_misses = summary_result.cache_misses
         else:
             await notify("未配置 LLM_API_KEY，返回解析预览。")
             report = build_parse_preview_report(document)
             usage = TokenUsage()
 
-        await send_report_result(
+        task_store.update_task(
+            task_id,
+            status="reporting",
+            event="sending report",
+            token_usage={
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "total_tokens": usage.total_tokens,
+            },
+            cache={"hits": cache_hits, "misses": cache_misses},
+        )
+        report_path = await send_report_result(
             client=client,
             message_id=message_id,
             storage_dir=storage_dir,
             source_file_name=safe_name,
             report=report,
             usage=usage,
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
+        )
+        task_store.update_task(
+            task_id,
+            status="succeeded",
+            event="task completed",
+            report_path=str(report_path),
         )
     except httpx.ReadTimeout:
         logger.exception("LLM timeout while processing file message %s", message_id)
+        task_store.update_task(
+            task_id,
+            status="failed",
+            event="LLM timeout",
+            error="LLM read timeout",
+        )
         await notify(
             "处理失败：模型调用超时。"
             f"当前超时设置 {settings.llm_timeout_ms // 1000} 秒，"
@@ -198,6 +291,12 @@ async def process_file_message_async(
         )
     except Exception as exc:
         logger.exception("failed to process file message %s", message_id)
+        task_store.update_task(
+            task_id,
+            status="failed",
+            event="task failed",
+            error=str(exc),
+        )
         await notify(f"处理失败：{exc}")
 
 

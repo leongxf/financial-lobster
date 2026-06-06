@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     feishu_encrypt_key: str = ""
 
     local_storage_dir: str = "storage/uploads"
+    task_storage_dir: str = "storage/tasks"
+    analysis_cache_dir: str = "storage/cache"
 
     llm_provider: str = "qwen"
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -25,6 +27,7 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.2
     llm_chunk_chars: int = 18_000
     llm_max_chunks: int = 12
+    prompt_version: str = "material_financial_summary:v1"
 
     model_config = SettingsConfigDict(
         env_file=".env",

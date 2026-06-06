@@ -1,6 +1,7 @@
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from app.services.analysis_cache import AnalysisCache, ChunkCacheKey, sha256_text
 from app.services.document_parser import ParsedDocument, ParsedPage
 from app.services.llm_provider import LLMProvider, TokenUsage
 
@@ -19,6 +20,8 @@ class TextChunk:
 class FinancialSummaryResult:
     markdown: str
     usage: TokenUsage
+    cache_hits: int = 0
+    cache_misses: int = 0
 
 
 SYSTEM_PROMPT = """你是服务于四大投资建议/交易咨询人员的材料分析助理。
@@ -77,6 +80,9 @@ async def generate_financial_summary_markdown(
     provider: LLMProvider,
     chunk_chars: int,
     max_chunks: int,
+    prompt_version: str,
+    file_hash: str,
+    cache: AnalysisCache | None = None,
     on_progress: ProgressCallback = None,
 ) -> FinancialSummaryResult:
     chunks = build_chunks(document.pages, chunk_chars=chunk_chars, max_chunks=max_chunks)
@@ -88,8 +94,36 @@ async def generate_financial_summary_markdown(
 
     chunk_notes: list[str] = []
     usage = TokenUsage()
+    cache_hits = 0
+    cache_misses = 0
     total = len(chunks)
     for chunk in chunks:
+        cached = None
+        cache_key = None
+        if cache is not None:
+            cache_key = ChunkCacheKey(
+                provider=provider.config.provider,
+                model=provider.config.model,
+                prompt_version=prompt_version,
+                chunk_chars=chunk_chars,
+                max_tokens=provider.config.max_tokens,
+                temperature=provider.config.temperature,
+                file_hash=file_hash,
+                chunk_index=chunk.index,
+                chunk_hash=sha256_text(chunk.text),
+            )
+            cached = cache.get_chunk(cache_key)
+
+        if cached is not None:
+            cache_hits += 1
+            if on_progress:
+                await on_progress(
+                    f"片段 {chunk.index}/{total} 命中缓存，跳过模型调用。"
+                )
+            chunk_notes.append(cached.markdown)
+            continue
+
+        cache_misses += 1
         if on_progress:
             await on_progress(
                 f"正在分析片段 {chunk.index}/{total}（第 {chunk.start_page}-{chunk.end_page} 页）..."
@@ -97,6 +131,17 @@ async def generate_financial_summary_markdown(
         chunk_result = await summarize_chunk(chunk, provider)
         chunk_notes.append(chunk_result.markdown)
         usage += chunk_result.usage
+        if cache is not None and cache_key is not None:
+            cache.set_chunk(
+                cache_key,
+                markdown=chunk_result.markdown,
+                usage=chunk_result.usage,
+                metadata={
+                    "source_file": document.file_path.name,
+                    "start_page": chunk.start_page,
+                    "end_page": chunk.end_page,
+                },
+            )
 
     if on_progress:
         await on_progress("正在合成最终 Markdown 报告...")
@@ -105,6 +150,8 @@ async def generate_financial_summary_markdown(
     return FinancialSummaryResult(
         markdown=final_result.markdown,
         usage=usage + final_result.usage,
+        cache_hits=cache_hits,
+        cache_misses=cache_misses,
     )
 
 
