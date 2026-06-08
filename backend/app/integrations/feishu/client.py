@@ -26,6 +26,34 @@ class FeishuClient:
                 raise RuntimeError(f"failed to get tenant access token: {data}")
             return token
 
+    async def send_text(
+        self,
+        receive_id: str,
+        text: str,
+        receive_id_type: str = "open_id",
+    ) -> None:
+        """主动给指定用户/群发送文本消息（im/v1/messages create 接口）。
+
+        与 reply_text 不同：reply 是回到原消息会话，send 是主动单聊/群发。
+        receive_id_type 支持 open_id / user_id / union_id / email / chat_id。
+        """
+        token = await self.get_tenant_access_token()
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                f"{self.base_url}/im/v1/messages",
+                params={"receive_id_type": receive_id_type},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                json={
+                    "receive_id": receive_id,
+                    "msg_type": "text",
+                    "content": json.dumps({"text": text}, ensure_ascii=False),
+                },
+            )
+            response.raise_for_status()
+            
     async def reply_text(self, message_id: str, text: str, max_chars: int = 3500) -> None:
         if len(text) <= max_chars:
             await self._reply_text_once(message_id, text)

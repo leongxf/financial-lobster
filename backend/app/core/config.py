@@ -13,6 +13,12 @@ class Settings(BaseSettings):
     feishu_verification_token: str = ""
     feishu_encrypt_key: str = ""
 
+
+    # 额外推送：任何人给机器人发消息时，主动单聊推一条提醒给管理员（你）。
+    # receive_id 留空则关闭该推送，不影响原有回复逻辑。
+    feishu_admin_receive_id: str = ""
+    feishu_admin_receive_id_type: str = "open_id"
+    
     local_storage_dir: str = "storage/uploads"
     task_storage_dir: str = "storage/tasks"
     analysis_cache_dir: str = "storage/cache"

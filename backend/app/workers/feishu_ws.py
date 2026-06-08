@@ -14,7 +14,7 @@ from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.integrations.feishu.client import FeishuClient
-from app.integrations.feishu.events import extract_file_message
+from app.integrations.feishu.events import extract_file_message, extract_message_brief
 from app.services.analysis_cache import AnalysisCache, sha256_file
 from app.services.document_parser import parse_document
 from app.services.financial_summary import generate_financial_summary_markdown
@@ -330,9 +330,74 @@ def start_file_processing(
     thread.start()
 
 
+def build_admin_notification(sender_id: str | None, message_type: str | None, summary: str) -> str:
+    sender_text = sender_id or "未知用户"
+    type_text = message_type or "未知类型"
+    return "\n".join(
+        [
+            "机器人收到一条新消息：",
+            "",
+            f"- 发送者 open_id：{sender_text}",
+            f"- 消息类型：{type_text}",
+            f"- 内容：{summary}",
+        ]
+    )
+
+
+async def push_admin_notification_async(settings: Settings, text: str) -> None:
+    client = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
+    await client.send_text(
+        receive_id=settings.feishu_admin_receive_id,
+        text=text,
+        receive_id_type=settings.feishu_admin_receive_id_type,
+    )
+
+
+def push_admin_notification(settings: Settings, text: str) -> None:
+    try:
+        asyncio.run(push_admin_notification_async(settings, text))
+    except Exception:
+        # 额外推送失败不能影响主流程，仅记录日志。
+        logger.exception("failed to push admin notification")
+
+
+def notify_admin_on_message(payload: dict, settings: Settings) -> None:
+    """额外推送旁路：独立于原有文件处理逻辑。
+
+    - 始终把发送者 open_id 打印到日志，便于拿自己的 ID。
+    - 已配置管理员接收人时，主动给管理员推一条提醒。
+    """
+    brief = extract_message_brief(payload)
+    if brief is None:
+        return
+
+    logger.info(
+        "feishu message sender open_id",
+        extra={
+            "sender_open_id": brief.sender_id,
+            "message_type": brief.message_type,
+            "chat_id": brief.chat_id,
+        },
+    )
+
+    if not settings.feishu_admin_receive_id:
+        return
+
+    text = build_admin_notification(brief.sender_id, brief.message_type, brief.summary)
+    thread = threading.Thread(
+        target=push_admin_notification,
+        args=(settings, text),
+        daemon=True,
+    )
+    thread.start()
+
+
 def handle_message_receive(data: P2ImMessageReceiveV1, settings: Settings) -> None:
     raw = lark.JSON.marshal(data)
     payload = json.loads(raw)
+
+    # 额外推送旁路：先给管理员推一条提醒，再走原有文件处理逻辑（原逻辑保持不变）。
+    notify_admin_on_message(payload, settings)
 
     file_message = extract_file_message(payload)
     if file_message is None:
