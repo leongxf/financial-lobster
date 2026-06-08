@@ -72,15 +72,22 @@ class ConversationStore:
         pages_path: str,
         summary: str = "",
         keywords: list[str] | None = None,
+        file_hash: str | None = None,
     ) -> None:
-        """新增或更新一个文件画像，并设为当前文件；超出上限按 LRU 淘汰。"""
+        """新增或更新一个文件画像，并设为当前文件；超出上限按 LRU 淘汰。
+
+        去重键优先用 file_hash（相同内容的文件视为同一个，重复上传复用同一条画像，
+        不挤占最近文件名额）；未提供 file_hash 时回退用 file_id。
+        """
         data = self.read(open_id)
         files: dict[str, Any] = data.setdefault("files", {})
         now = _now_iso()
 
-        existing = files.get(file_id) or {}
-        files[file_id] = {
+        dedup_key = file_hash or file_id
+        existing = files.get(dedup_key) or {}
+        files[dedup_key] = {
             "file_id": file_id,
+            "file_hash": file_hash,
             "file_name": file_name,
             "pages_path": pages_path,
             "summary": summary,
@@ -89,7 +96,7 @@ class ConversationStore:
             "created_at": existing.get("created_at", now),
             "last_active_at": now,
         }
-        data["current_file_id"] = file_id
+        data["current_file_id"] = dedup_key
         self._evict(files)
         # 当前文件可能被淘汰的极端情况：重新指向最近活跃文件。
         if data["current_file_id"] not in files:
@@ -158,12 +165,12 @@ class ConversationStore:
         if len(files) <= self.recent_files_max:
             return
         # 按最近活跃时间升序，淘汰最旧的，直到不超过上限。
-        ordered = sorted(files.values(), key=lambda f: f.get("last_active_at", ""))
-        for entry in ordered[: len(files) - self.recent_files_max]:
-            files.pop(entry["file_id"], None)
+        ordered = sorted(files.items(), key=lambda kv: kv[1].get("last_active_at", ""))
+        for key, _ in ordered[: len(files) - self.recent_files_max]:
+            files.pop(key, None)
 
     @staticmethod
     def _most_recent_file_id(files: dict[str, Any]) -> str | None:
         if not files:
             return None
-        return max(files.values(), key=lambda f: f.get("last_active_at", ""))["file_id"]
+        return max(files.items(), key=lambda kv: kv[1].get("last_active_at", ""))[0]

@@ -308,6 +308,7 @@ async def process_file_message_async(
                 pages_path=str(pages_path),
                 summary=summary_line[:200],
                 keywords=keywords,
+                file_hash=file_hash,
             )
             await notify(
                 "你现在可以直接发文字向我追问这个文件的内容，例如「营业收入是多少」。"

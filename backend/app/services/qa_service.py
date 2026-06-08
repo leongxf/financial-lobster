@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -8,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from app.services.llm_provider import LLMProvider, TokenUsage
+
+logger = logging.getLogger(__name__)
 
 QA_SYSTEM_PROMPT = """你是服务于四大投资建议/交易咨询人员的材料追问助理。
 用户已上传财务/经营材料，现在就材料内容向你追问。
@@ -143,7 +146,31 @@ async def answer_question(
 ) -> QaResult:
     context = retrieve_pages(question, pages, top_k=top_k, max_chars=max_chars)
     messages = build_qa_messages(question, context, history)
+
+    # 追问请求日志：用于排查追问效果不理想（检索命中、历史轮数、最终 prompt 全文）。
+    logger.info(
+        "[QA] request | question=%r | hit_pages=%s | context_chars=%d | history_turns=%d | messages=%d",
+        question,
+        context.page_numbers,
+        len(context.text),
+        len(history) // 2,
+        len(messages),
+    )
+    logger.info(
+        "[QA] llm payload:\n%s",
+        json.dumps(messages, ensure_ascii=False, indent=2),
+    )
+
     result = await provider.complete(messages)
+
+    logger.info(
+        "[QA] response | usage(in/out/total)=%d/%d/%d | answer=%r",
+        result.usage.input_tokens,
+        result.usage.output_tokens,
+        result.usage.total_tokens,
+        result.content,
+    )
+
     return QaResult(
         answer=result.content,
         usage=result.usage,
