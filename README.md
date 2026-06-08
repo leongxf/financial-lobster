@@ -9,42 +9,53 @@
 3. 后端识别文件消息。
 4. 机器人回复“已收到文件，正在分析”。
 
-## 本地启动
+## 本地开发
+
+本地直接运行，不需要 Docker。
 
 ```bash
 cp .env.example .env
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-uvicorn app.main:app --app-dir backend --reload
+PYTHONPATH=backend .venv/bin/python -m app.workers.feishu_ws
 ```
 
-健康检查：
+飞书开放平台事件订阅方式选择：**使用长连接接收事件**。
+
+## 远端部署（Docker）
+
+服务器上 clone 项目并配置 `.env` 后，用脚本一键部署（默认会先 `git pull` 再构建）：
 
 ```bash
-curl http://127.0.0.1:8000/health
+chmod +x scripts/start.sh
+./scripts/start.sh
 ```
 
-## 飞书长连接
-
-启动长连接 worker：
+跳过代码更新、仅重建容器：
 
 ```bash
-.venv/bin/python -m app.workers.feishu_ws
+./scripts/start.sh --no-pull
 ```
 
-飞书开放平台事件订阅方式选择：
+也可手动执行：
 
-```text
-使用长连接接收事件
+```bash
+docker compose up -d --build
 ```
 
-## HTTP 回调备选
+查看日志：
 
-如果不用长连接，也可以配置飞书事件回调地址：
+```bash
+docker compose logs -f feishu-worker
+```
 
-```text
-https://your-domain.example.com/api/feishu/events
+数据目录 `./storage` 会挂载到容器内，用于上传文件、任务 JSON 与分片缓存。
+
+停止服务：
+
+```bash
+docker compose down
 ```
 
 ## 飞书配置
@@ -53,9 +64,7 @@ https://your-domain.example.com/api/feishu/events
 
 - `FEISHU_APP_ID`
 - `FEISHU_APP_SECRET`
-- `FEISHU_VERIFICATION_TOKEN`
-- 事件订阅方式：优先选择“使用长连接接收事件”
-- HTTP 回调备选地址：`/api/feishu/events`
+- 事件订阅方式：**使用长连接接收事件**
 - 权限：接收消息、读取消息文件、回复消息
 
 MVP 上传入口是飞书机器人消息。H5/Web 上传不是 MVP 入口。

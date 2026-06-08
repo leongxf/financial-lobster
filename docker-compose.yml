@@ -1,0 +1,12 @@
+services:
+  feishu-worker:
+    build: .
+    container_name: financial-lobster-worker
+    env_file:
+      - .env
+    environment:
+      ENVIRONMENT: docker
+    volumes:
+      - ./storage:/app/storage
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.feishu_ws"]
