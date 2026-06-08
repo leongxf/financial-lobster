@@ -97,6 +97,22 @@ prepare_storage() {
   mkdir -p storage/uploads storage/tasks storage/cache
 }
 
+cleanup_existing() {
+  # 危险操作：部署机为专机专用，仅运行本服务，这里清理整机所有 Docker 容器。
+  # 如果将来该机器会运行其他容器，必须改回仅清理本项目（compose down）。
+  log "清理整机所有 Docker 容器 ..."
+
+  # 先用 compose 优雅清理本项目的容器、网络与孤儿容器。
+  compose down --remove-orphans >/dev/null 2>&1 || true
+
+  # 停止并删除机器上剩余的所有容器（含已退出的）。
+  local containers
+  containers="$(docker ps -aq)"
+  if [[ -n "$containers" ]]; then
+    docker rm -f $containers >/dev/null 2>&1 || true
+  fi
+}
+
 update_code() {
   if [[ "$SKIP_PULL" == "true" ]]; then
     log "跳过代码更新（--no-pull）"
@@ -118,12 +134,24 @@ update_code() {
   git pull --ff-only
 }
 
+compose_cmd() {
+  if docker compose version >/dev/null 2>&1; then
+    printf 'docker compose'
+  elif command -v docker-compose >/dev/null 2>&1; then
+    printf 'docker-compose'
+  else
+    printf 'docker compose'
+  fi
+}
+
 print_status() {
+  local cc
+  cc="$(compose_cmd)"
   compose ps
   echo
   log "启动完成（飞书长连接 worker）"
-  log "查看日志：docker compose logs -f feishu-worker"
-  log "停止服务：docker compose down"
+  log "查看日志：${cc} logs -f feishu-worker"
+  log "停止服务：${cc} down"
 }
 
 main() {
@@ -133,6 +161,7 @@ main() {
   validate_env
   update_code
   prepare_storage
+  cleanup_existing
   log "构建并启动 feishu-worker ..."
   compose up -d --build
   print_status
