@@ -16,10 +16,12 @@ from app.core.logging import configure_logging
 from app.integrations.feishu.client import FeishuClient
 from app.integrations.feishu.events import extract_file_message, extract_message_brief
 from app.services.analysis_cache import AnalysisCache, sha256_file
+from app.services.conversation_store import ConversationStore
 from app.services.document_parser import parse_document
 from app.services.financial_summary import generate_financial_summary_markdown
 from app.services.llm_provider import LLMConfig, LLMProvider, TokenUsage
 from app.services.markdown_report import build_parse_preview_report
+from app.services.qa_service import answer_question, extract_keywords, load_pages, score_file_by_keywords
 from app.services.task_store import TaskStore
 
 logger = logging.getLogger(__name__)
@@ -116,11 +118,16 @@ async def process_file_message_async(
     message_id: str,
     file_key: str,
     file_name: str | None,
+    sender_id: str | None = None,
 ) -> None:
     task_id = message_id
     client = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
     task_store = TaskStore(settings.task_storage_dir)
     analysis_cache = AnalysisCache(settings.analysis_cache_dir)
+    conversation_store = ConversationStore(
+        settings.conversation_storage_dir,
+        recent_files_max=settings.qa_recent_files_max,
+    )
     safe_name = file_name or "uploaded-file"
     storage_dir = Path(settings.local_storage_dir) / message_id
     target_path = storage_dir / safe_name
@@ -169,6 +176,15 @@ async def process_file_message_async(
         page_info = document.page_count if document.page_count is not None else "未知"
         extracted_text_path = storage_dir / "extracted_text.txt"
         extracted_text_path.write_text(document.text, encoding="utf-8")
+        # 保存分页文本，供后续追问按页检索。
+        pages_path = storage_dir / "pages.json"
+        pages_path.write_text(
+            json.dumps(
+                [{"page_number": p.page_number, "text": p.text} for p in document.pages],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
         task_store.update_task(
             task_id,
             status="parsed",
@@ -177,6 +193,7 @@ async def process_file_message_async(
             page_count=document.page_count,
             extracted_text_chars=char_count,
             extracted_text_path=str(extracted_text_path),
+            pages_path=str(pages_path),
         )
         await notify(
             f"文本提取完成：{page_info} 页，约 {char_count:,} 字符。"
@@ -276,6 +293,25 @@ async def process_file_message_async(
             event="task completed",
             report_path=str(report_path),
         )
+
+        # 写入文件画像到会话存储，支持后续多轮追问（按 open_id 维护最近 N 个文件）。
+        if sender_id:
+            keywords = extract_keywords(document.text)
+            summary_line = next(
+                (line.strip() for line in report.splitlines() if line.strip()),
+                safe_name,
+            )
+            conversation_store.upsert_file(
+                sender_id,
+                file_id=task_id,
+                file_name=file_name,
+                pages_path=str(pages_path),
+                summary=summary_line[:200],
+                keywords=keywords,
+            )
+            await notify(
+                "你现在可以直接发文字向我追问这个文件的内容，例如「营业收入是多少」。"
+            )
     except httpx.ReadTimeout:
         logger.exception("LLM timeout while processing file message %s", message_id)
         task_store.update_task(
@@ -305,6 +341,7 @@ def process_file_message(
     message_id: str,
     file_key: str,
     file_name: str | None,
+    sender_id: str | None = None,
 ) -> None:
     asyncio.run(
         process_file_message_async(
@@ -312,6 +349,7 @@ def process_file_message(
             message_id=message_id,
             file_key=file_key,
             file_name=file_name,
+            sender_id=sender_id,
         )
     )
 
@@ -321,10 +359,11 @@ def start_file_processing(
     message_id: str,
     file_key: str,
     file_name: str | None,
+    sender_id: str | None = None,
 ) -> None:
     thread = threading.Thread(
         target=process_file_message,
-        args=(settings, message_id, file_key, file_name),
+        args=(settings, message_id, file_key, file_name, sender_id),
         daemon=True,
     )
     thread.start()
@@ -392,6 +431,140 @@ def notify_admin_on_message(payload: dict, settings: Settings) -> None:
     thread.start()
 
 
+async def process_question_async(
+    settings: Settings,
+    message_id: str,
+    sender_id: str,
+    question: str,
+) -> None:
+    """处理用户对已上传文件的文字追问。"""
+    client = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
+    conversation_store = ConversationStore(
+        settings.conversation_storage_dir,
+        recent_files_max=settings.qa_recent_files_max,
+    )
+
+    async def notify(text: str) -> None:
+        await client.reply_text(message_id, text)
+
+    if not settings.llm_api_key:
+        await notify("未配置 LLM_API_KEY，暂时无法回答追问。")
+        return
+
+    files = conversation_store.list_files(sender_id)
+    if not files:
+        await notify("我还没有你最近上传的文件，请先发送一个 PDF 给我分析后再追问。")
+        return
+
+    # 第一级：按关键字重合度在最近文件中选最相关的；都不命中则用当前（最近活跃）文件。
+    best = max(files, key=lambda f: score_file_by_keywords(question, f.get("keywords", [])))
+    if score_file_by_keywords(question, best.get("keywords", [])) == 0:
+        best = files[0]  # list_files 已按最近活跃排序
+
+    file_id = best["file_id"]
+    pages = load_pages(best.get("pages_path", ""))
+    if not pages:
+        await notify("该文件的解析内容已不可用，请重新上传后再追问。")
+        return
+
+    try:
+        provider = LLMProvider(
+            LLMConfig(
+                provider=settings.llm_provider,
+                base_url=settings.llm_base_url,
+                api_key=settings.llm_api_key,
+                model=settings.llm_model,
+                timeout_ms=settings.llm_timeout_ms,
+                max_tokens=settings.llm_max_tokens,
+                temperature=settings.llm_temperature,
+            )
+        )
+        history = conversation_store.recent_history(
+            sender_id, file_id, max_turns=settings.qa_history_max_turns
+        )
+        result = await answer_question(
+            question=question,
+            pages=pages,
+            history=history,
+            provider=provider,
+            top_k=settings.qa_retrieve_top_k,
+            max_chars=settings.qa_context_max_chars,
+        )
+        conversation_store.append_history(
+            sender_id,
+            file_id,
+            question=question,
+            answer=result.answer,
+            max_turns=settings.qa_history_max_turns,
+        )
+        source = f"（基于《{best.get('file_name') or '当前文件'}》"
+        if result.page_numbers:
+            source += "，参考第 " + "、".join(str(p) for p in result.page_numbers) + " 页"
+        source += "）"
+        await notify(result.answer + "\n\n" + source)
+    except httpx.ReadTimeout:
+        logger.exception("LLM timeout while answering question %s", message_id)
+        await notify("回答超时，请稍后重试，或缩短问题后再试。")
+    except Exception as exc:
+        logger.exception("failed to answer question %s", message_id)
+        await notify(f"回答失败：{exc}")
+
+
+def process_question(
+    settings: Settings,
+    message_id: str,
+    sender_id: str,
+    question: str,
+) -> None:
+    asyncio.run(process_question_async(settings, message_id, sender_id, question))
+
+
+def start_question_processing(
+    settings: Settings,
+    message_id: str,
+    sender_id: str,
+    question: str,
+) -> None:
+    thread = threading.Thread(
+        target=process_question,
+        args=(settings, message_id, sender_id, question),
+        daemon=True,
+    )
+    thread.start()
+
+
+def extract_text_question(payload: dict) -> tuple[str, str, str] | None:
+    """从文本消息事件中提取 (message_id, sender_open_id, 问题文本)。非文本消息返回 None。"""
+    event = payload.get("event")
+    if not isinstance(event, dict):
+        return None
+    message = event.get("message")
+    if not isinstance(message, dict) or message.get("message_type") != "text":
+        return None
+    message_id = message.get("message_id")
+    if not message_id:
+        return None
+
+    content = message.get("content")
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except json.JSONDecodeError:
+            content = {}
+    text = str((content or {}).get("text") or "").strip()
+    if not text:
+        return None
+
+    sender = event.get("sender")
+    sender_id = None
+    if isinstance(sender, dict) and isinstance(sender.get("sender_id"), dict):
+        sender_id = sender["sender_id"].get("open_id")
+    if not sender_id:
+        return None
+
+    return message_id, sender_id, text
+
+
 def handle_message_receive(data: P2ImMessageReceiveV1, settings: Settings) -> None:
     raw = lark.JSON.marshal(data)
     payload = json.loads(raw)
@@ -401,6 +574,22 @@ def handle_message_receive(data: P2ImMessageReceiveV1, settings: Settings) -> No
 
     file_message = extract_file_message(payload)
     if file_message is None:
+        # 非文件消息：尝试作为文本追问处理。
+        question = extract_text_question(payload)
+        if question is not None:
+            q_message_id, q_sender_id, q_text = question
+            logger.info(
+                "received feishu text question",
+                extra={"message_id": q_message_id, "sender_id": q_sender_id},
+            )
+            start_question_processing(
+                settings=settings,
+                message_id=q_message_id,
+                sender_id=q_sender_id,
+                question=q_text,
+            )
+            return
+
         message_type = (
             payload.get("event", {}).get("message", {}).get("message_type")
         )
@@ -424,6 +613,7 @@ def handle_message_receive(data: P2ImMessageReceiveV1, settings: Settings) -> No
         message_id=file_message.message_id,
         file_key=file_message.file_key,
         file_name=file_message.file_name,
+        sender_id=file_message.sender_id,
     )
 
 
