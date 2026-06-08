@@ -6,8 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/backend
 
-# 引入 uv（仅拷贝二进制，无需 pip 安装），用于快速、可缓存地装依赖。
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# 引入 uv（走 PyPI 安装，避免拉取 ghcr 镜像超时），用于快速、可缓存地装依赖。
+RUN pip install --no-cache-dir uv
 
 # 第一层：仅依赖 pyproject.toml，从中解析并安装第三方依赖（依赖清单的单一数据源）。
 # 只要 pyproject.toml 不变，这一层命中缓存；改 backend 代码不会重新下载依赖。
