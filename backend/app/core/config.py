@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     local_storage_dir: str = "storage/uploads"
     task_storage_dir: str = "storage/tasks"
     analysis_cache_dir: str = "storage/cache"
+    # 飞书事件去重标记目录：按 message_id 记录已处理事件，避免重推导致重复分析。
+    event_dedup_dir: str = "storage/events"
+
+    # 上传门禁：限制单文件大小与可接受的文件类型，下载前先拦截，避免浪费带宽/磁盘。
+    max_file_size_mb: int = 20
+    allowed_file_extensions: str = ".pdf,.docx,.csv,.xlsx"
 
     llm_provider: str = "qwen"
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -55,6 +61,18 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @property
+    def allowed_extensions(self) -> set[str]:
+        return {
+            ext.strip().lower()
+            for ext in self.allowed_file_extensions.split(",")
+            if ext.strip()
+        }
+
+    @property
+    def max_file_size_bytes(self) -> int:
+        return self.max_file_size_mb * 1024 * 1024
 
 
 @lru_cache

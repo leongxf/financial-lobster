@@ -48,7 +48,7 @@ class LLMProvider:
         max_retries: int = 2,
     ) -> LLMResult:
         if not self.config.api_key:
-            raise RuntimeError("LLM_API_KEY is required")
+            raise RuntimeError("未配置 LLM_API_KEY")
 
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         read_timeout = self.config.timeout_ms / 1000
@@ -90,12 +90,12 @@ class LLMProvider:
 
         choices = data.get("choices") or []
         if not choices:
-            raise RuntimeError(f"LLM response has no choices: {data}")
+            raise RuntimeError(f"LLM 响应缺少 choices：{data}")
 
         message = choices[0].get("message") or {}
         content = message.get("content")
         if not content:
-            raise RuntimeError(f"LLM response has no content: {data}")
+            raise RuntimeError(f"LLM 响应缺少 content：{data}")
 
         return LLMResult(content=content, usage=_parse_usage(data.get("usage") or {}))
 
@@ -111,7 +111,7 @@ class LLMProvider:
         返回顺序与入参 texts 一一对应。
         """
         if not self.config.api_key:
-            raise RuntimeError("LLM_API_KEY is required")
+            raise RuntimeError("未配置 LLM_API_KEY")
         if not texts:
             return []
 
@@ -151,7 +151,7 @@ class LLMProvider:
         items = data.get("data") or []
         if len(items) != len(texts):
             raise RuntimeError(
-                f"Embedding response count mismatch: got {len(items)}, expected {len(texts)}"
+                f"Embedding 响应数量不匹配：返回 {len(items)} 条，预期 {len(texts)} 条"
             )
         # 按 index 排序，确保与入参顺序对齐。
         items.sort(key=lambda it: int(it.get("index") or 0))

@@ -23,7 +23,7 @@ class FeishuClient:
             data = response.json()
             token = data.get("tenant_access_token")
             if not token:
-                raise RuntimeError(f"failed to get tenant access token: {data}")
+                raise RuntimeError(f"获取 tenant access token 失败：{data}")
             return token
 
     async def send_text(
@@ -114,7 +114,7 @@ class FeishuClient:
         data = response.json()
         file_key = (data.get("data") or {}).get("file_key")
         if not file_key:
-            raise RuntimeError(f"failed to upload report file: {data}")
+            raise RuntimeError(f"上传报告文件失败：{data}")
         return file_key
 
     async def _reply_file_once(self, message_id: str, file_key: str) -> None:

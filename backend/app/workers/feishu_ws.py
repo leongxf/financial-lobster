@@ -18,6 +18,7 @@ from app.integrations.feishu.events import extract_file_message, extract_message
 from app.services.analysis_cache import AnalysisCache, sha256_file
 from app.services.conversation_store import ConversationStore
 from app.services.document_parser import parse_document
+from app.services.event_dedup import EventDeduplicator
 from app.services.financial_summary import generate_financial_summary_markdown
 from app.services.llm_provider import LLMConfig, LLMProvider, TokenUsage
 from app.services.markdown_report import build_parse_preview_report
@@ -100,6 +101,46 @@ def build_ack_message(settings: Settings, file_name: str | None) -> str:
     )
 
 
+def _format_size(num_bytes: int) -> str:
+    return f"{num_bytes / (1024 * 1024):.1f}MB"
+
+
+def check_upload_allowed(
+    settings: Settings,
+    file_name: str | None,
+    file_size: int | None,
+) -> str | None:
+    """下载前的上传门禁：校验文件类型白名单与大小上限。
+
+    通过返回 None；被拒则返回给用户的中文提示文案。file_size 在飞书事件中可能缺失，
+    缺失时跳过大小校验，由下载后基于真实文件大小再兜底一次。
+    """
+    suffix = Path(file_name or "").suffix.lower()
+    allowed = settings.allowed_extensions
+    if suffix not in allowed:
+        allowed_text = "、".join(sorted(allowed)) if allowed else "无"
+        return "\n".join(
+            [
+                "无法处理该文件：文件类型不在支持范围内。",
+                "",
+                f"- 文件：{file_name or '未命名文件'}",
+                f"- 类型：{suffix or '未知'}",
+                f"- 当前支持：{allowed_text}",
+            ]
+        )
+    if file_size is not None and file_size > settings.max_file_size_bytes:
+        return "\n".join(
+            [
+                "无法处理该文件：超过大小上限。",
+                "",
+                f"- 文件：{file_name or '未命名文件'}",
+                f"- 大小：约 {_format_size(file_size)}",
+                f"- 上限：{settings.max_file_size_mb}MB",
+            ]
+        )
+    return None
+
+
 def format_token_usage(
     usage: TokenUsage,
     *,
@@ -171,6 +212,7 @@ async def process_file_message_async(
     file_key: str,
     file_name: str | None,
     sender_id: str | None = None,
+    file_size: int | None = None,
 ) -> None:
     task_id = message_id
     client = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
@@ -196,6 +238,19 @@ async def process_file_message_async(
             model=settings.llm_model,
             provider=settings.llm_provider,
         )
+
+        # 上传门禁：下载前先按类型白名单与已知大小拦截，避免浪费带宽/磁盘。
+        reject_reason = check_upload_allowed(settings, file_name, file_size)
+        if reject_reason is not None:
+            task_store.update_task(
+                task_id,
+                status="rejected",
+                event="upload rejected",
+                error=reject_reason.splitlines()[0],
+            )
+            await notify(reject_reason)
+            return
+
         await notify(build_ack_message(settings, file_name))
 
         task_store.update_task(task_id, status="downloading", event="downloading file")
@@ -204,6 +259,28 @@ async def process_file_message_async(
             file_key,
             target_path,
         )
+
+        # 下载后基于真实文件大小再兜底一次（飞书事件可能不带 file_size）。
+        actual_size = downloaded_path.stat().st_size
+        if actual_size > settings.max_file_size_bytes:
+            downloaded_path.unlink(missing_ok=True)
+            reason = "\n".join(
+                [
+                    "无法处理该文件：超过大小上限。",
+                    "",
+                    f"- 文件：{downloaded_path.name}",
+                    f"- 大小：约 {_format_size(actual_size)}",
+                    f"- 上限：{settings.max_file_size_mb}MB",
+                ]
+            )
+            task_store.update_task(
+                task_id,
+                status="rejected",
+                event="upload rejected: oversize",
+                error=f"file too large: {actual_size} bytes",
+            )
+            await notify(reason)
+            return
         logger.info(
             "downloaded feishu file",
             extra={
@@ -466,6 +543,7 @@ def process_file_message(
     file_key: str,
     file_name: str | None,
     sender_id: str | None = None,
+    file_size: int | None = None,
 ) -> None:
     asyncio.run(
         process_file_message_async(
@@ -474,6 +552,7 @@ def process_file_message(
             file_key=file_key,
             file_name=file_name,
             sender_id=sender_id,
+            file_size=file_size,
         )
     )
 
@@ -484,10 +563,11 @@ def start_file_processing(
     file_key: str,
     file_name: str | None,
     sender_id: str | None = None,
+    file_size: int | None = None,
 ) -> None:
     thread = threading.Thread(
         target=process_file_message,
-        args=(settings, message_id, file_key, file_name, sender_id),
+        args=(settings, message_id, file_key, file_name, sender_id, file_size),
         daemon=True,
     )
     thread.start()
@@ -720,9 +800,29 @@ def extract_text_question(payload: dict) -> tuple[str, str, str] | None:
     return message_id, sender_id, text
 
 
+def extract_message_id(payload: dict) -> str | None:
+    """从事件 payload 中提取 message_id，用于事件级去重。"""
+    event = payload.get("event")
+    if not isinstance(event, dict):
+        return None
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return None
+    message_id = message.get("message_id")
+    return message_id if isinstance(message_id, str) and message_id else None
+
+
 def handle_message_receive(data: P2ImMessageReceiveV1, settings: Settings) -> None:
     raw = lark.JSON.marshal(data)
     payload = json.loads(raw)
+
+    # 事件幂等：飞书重推同一事件（message_id 不变）时直接丢弃，避免重复分析/回复/消耗 token。
+    # 放在最前面，连管理员提醒也不重复推。
+    message_id = extract_message_id(payload)
+    deduplicator = EventDeduplicator(settings.event_dedup_dir)
+    if message_id and not deduplicator.mark_if_new(message_id):
+        logger.info("ignored duplicate feishu event", extra={"message_id": message_id})
+        return
 
     # 额外推送旁路：先给管理员推一条提醒，再走原有文件处理逻辑（原逻辑保持不变）。
     notify_admin_on_message(payload, settings)
@@ -769,6 +869,7 @@ def handle_message_receive(data: P2ImMessageReceiveV1, settings: Settings) -> No
         file_key=file_message.file_key,
         file_name=file_message.file_name,
         sender_id=file_message.sender_id,
+        file_size=file_message.file_size,
     )
 
 
@@ -777,7 +878,7 @@ def main() -> None:
     configure_logging(settings.log_level)
 
     if not settings.feishu_app_id or not settings.feishu_app_secret:
-        raise RuntimeError("FEISHU_APP_ID and FEISHU_APP_SECRET are required")
+        raise RuntimeError("未配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET")
 
     def on_message_receive(data: P2ImMessageReceiveV1) -> None:
         handle_message_receive(data, settings)

@@ -25,7 +25,7 @@ async def handle_feishu_event(
 
     if not validate_verification_token(payload, settings.feishu_verification_token):
         logger.warning("feishu verification token mismatch")
-        raise HTTPException(status_code=401, detail="invalid verification token")
+        raise HTTPException(status_code=401, detail="verification token 校验失败")
 
     if is_challenge_event(payload):
         return {"challenge": payload["challenge"]}
