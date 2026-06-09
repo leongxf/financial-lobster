@@ -99,6 +99,64 @@ class LLMProvider:
 
         return LLMResult(content=content, usage=_parse_usage(data.get("usage") or {}))
 
+    async def embed(
+        self,
+        texts: list[str],
+        model: str,
+        max_retries: int = 2,
+    ) -> list[list[float]]:
+        """调用 OpenAI 兼容 /embeddings 接口，批量返回每条文本的向量。
+
+        复用同一套 base_url 与 api_key；embedding 模型名由调用方传入（与 chat 模型独立）。
+        返回顺序与入参 texts 一一对应。
+        """
+        if not self.config.api_key:
+            raise RuntimeError("LLM_API_KEY is required")
+        if not texts:
+            return []
+
+        url = self.config.base_url.rstrip("/") + "/embeddings"
+        read_timeout = self.config.timeout_ms / 1000
+        timeout = httpx.Timeout(connect=15.0, read=read_timeout, write=15.0, pool=15.0)
+        last_error: Exception | None = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.post(
+                        url,
+                        headers={
+                            "Authorization": f"Bearer {self.config.api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={"model": model, "input": texts},
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                break
+            except httpx.ReadTimeout as exc:
+                last_error = exc
+                if attempt >= max_retries:
+                    raise
+                logger.warning(
+                    "Embedding read timeout, retrying %s/%s",
+                    attempt + 1,
+                    max_retries,
+                )
+                await asyncio.sleep(2)
+        else:
+            assert last_error is not None
+            raise last_error
+
+        items = data.get("data") or []
+        if len(items) != len(texts):
+            raise RuntimeError(
+                f"Embedding response count mismatch: got {len(items)}, expected {len(texts)}"
+            )
+        # 按 index 排序，确保与入参顺序对齐。
+        items.sort(key=lambda it: int(it.get("index") or 0))
+        return [list(it.get("embedding") or []) for it in items]
+
 
 def _parse_usage(raw_usage: dict) -> TokenUsage:
     input_tokens = _as_int(

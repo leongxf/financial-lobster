@@ -73,11 +73,17 @@ class ConversationStore:
         summary: str = "",
         keywords: list[str] | None = None,
         file_hash: str | None = None,
+        embeddings_path: str = "",
     ) -> None:
         """新增或更新一个文件画像，并设为当前文件；超出上限按 LRU 淘汰。
 
         去重键优先用 file_hash（相同内容的文件视为同一个，重复上传复用同一条画像，
         不挤占最近文件名额）；未提供 file_hash 时回退用 file_id。
+
+        画像额外记录：
+        - entry_key：该画像在 files 字典中的键（= dedup_key），供调用方做 history 读写时
+          与字典键保持一致（file_hash 去重后 file_id 不再等于字典键）。
+        - embeddings_path：向量缓存文件路径（按 file_hash 命名），用于追问时向量检索。
         """
         data = self.read(open_id)
         files: dict[str, Any] = data.setdefault("files", {})
@@ -86,10 +92,12 @@ class ConversationStore:
         dedup_key = file_hash or file_id
         existing = files.get(dedup_key) or {}
         files[dedup_key] = {
+            "entry_key": dedup_key,
             "file_id": file_id,
             "file_hash": file_hash,
             "file_name": file_name,
             "pages_path": pages_path,
+            "embeddings_path": embeddings_path,
             "summary": summary,
             "keywords": keywords or [],
             "history": existing.get("history", []),

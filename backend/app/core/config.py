@@ -38,10 +38,17 @@ class Settings(BaseSettings):
     # 追问问答（多轮对话）相关配置。
     conversation_storage_dir: str = "storage/conversations"
     qa_recent_files_max: int = 5  # 每个用户最多记住最近 N 个文件，超出按 LRU 淘汰。
-    qa_retrieve_top_k: int = 5  # 文件内按页检索时取相关度最高的前 K 页。
+    qa_retrieve_top_k: int = 5  # 文件内检索时取相关度最高的前 K 个片段。
     qa_context_max_chars: int = 24_000  # 单次喂给模型的检索片段字符预算上限。
     qa_history_max_turns: int = 5  # 单文件追问携带的最近对话轮数上限。
     qa_prompt_version: str = "material_qa:v1"
+
+    # 向量检索（embedding）相关配置。中英混排材料靠多语言 embedding 做语义检索。
+    qa_embedding_model: str = "text-embedding-v3"  # dashscope 多语言向量模型。
+    qa_embedding_chunk_chars: int = 700  # 切块字符数：检索粒度，小于整页以提升命中精度。
+    qa_embedding_chunk_overlap: int = 120  # 相邻块重叠字符，避免答案被切在块边界。
+    qa_embedding_batch_size: int = 10  # 单次 embedding 请求的最大文本条数（接口上限）。
+    qa_embedding_cache_dir: str = "storage/embeddings"  # 向量缓存目录，按 file_hash 命名。
 
     model_config = SettingsConfigDict(
         env_file=".env",

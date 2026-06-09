@@ -21,7 +21,18 @@ from app.services.document_parser import parse_document
 from app.services.financial_summary import generate_financial_summary_markdown
 from app.services.llm_provider import LLMConfig, LLMProvider, TokenUsage
 from app.services.markdown_report import build_parse_preview_report
-from app.services.qa_service import answer_question, extract_keywords, load_pages, score_file_by_keywords
+from app.services.qa_service import (
+    answer_question,
+    build_chunk_embeddings,
+    embedding_cache_file,
+    extract_keywords,
+    load_cached_embeddings,
+    load_pages,
+    retrieve_by_embedding,
+    retrieve_pages,
+    save_cached_embeddings,
+    score_file_by_keywords,
+)
 from app.services.task_store import TaskStore
 
 logger = logging.getLogger(__name__)
@@ -301,6 +312,60 @@ async def process_file_message_async(
                 (line.strip() for line in report.splitlines() if line.strip()),
                 safe_name,
             )
+
+            # 预计算向量（embedding）供追问做语义检索；中英混排材料靠它解决跨语言检索。
+            # 按 file_hash 缓存：同内容文件重传直接复用，不重算。失败不阻断主流程。
+            embeddings_path = ""
+            if settings.llm_api_key:
+                cache_dir = settings.qa_embedding_cache_dir
+                try:
+                    pages_data = [
+                        {"page_number": p.page_number, "text": p.text}
+                        for p in document.pages
+                    ]
+                    cached = load_cached_embeddings(cache_dir, file_hash)
+                    if cached is None:
+                        embed_provider = LLMProvider(
+                            LLMConfig(
+                                provider=settings.llm_provider,
+                                base_url=settings.llm_base_url,
+                                api_key=settings.llm_api_key,
+                                model=settings.llm_model,
+                                timeout_ms=settings.llm_timeout_ms,
+                                max_tokens=settings.llm_max_tokens,
+                                temperature=settings.llm_temperature,
+                            )
+                        )
+                        chunks = await build_chunk_embeddings(
+                            pages_data,
+                            provider=embed_provider,
+                            model=settings.qa_embedding_model,
+                            chunk_chars=settings.qa_embedding_chunk_chars,
+                            overlap=settings.qa_embedding_chunk_overlap,
+                            batch_size=settings.qa_embedding_batch_size,
+                        )
+                        save_cached_embeddings(
+                            cache_dir, file_hash, chunks, settings.qa_embedding_model
+                        )
+                        logger.info(
+                            "[QA] embeddings built | file_hash=%s | chunks=%d",
+                            file_hash,
+                            len(chunks),
+                        )
+                    else:
+                        logger.info(
+                            "[QA] embeddings cache hit | file_hash=%s | chunks=%d",
+                            file_hash,
+                            len(cached),
+                        )
+                    embeddings_path = str(embedding_cache_file(cache_dir, file_hash))
+                except Exception:
+                    logger.exception(
+                        "[QA] failed to build embeddings for %s, fallback to keyword retrieval",
+                        file_hash,
+                    )
+                    embeddings_path = ""
+
             conversation_store.upsert_file(
                 sender_id,
                 file_id=task_id,
@@ -309,6 +374,7 @@ async def process_file_message_async(
                 summary=summary_line[:200],
                 keywords=keywords,
                 file_hash=file_hash,
+                embeddings_path=embeddings_path,
             )
             await notify(
                 "你现在可以直接发文字向我追问这个文件的内容，例如「营业收入是多少」。"
@@ -462,7 +528,8 @@ async def process_question_async(
     if score_file_by_keywords(question, best.get("keywords", [])) == 0:
         best = files[0]  # list_files 已按最近活跃排序
 
-    file_id = best["file_id"]
+    # history 读写键统一用 entry_key（= 会话存储里的字典键；file_hash 去重后它不等于 file_id）。
+    file_id = best.get("entry_key") or best["file_id"]
     pages = load_pages(best.get("pages_path", ""))
     if not pages:
         await notify("该文件的解析内容已不可用，请重新上传后再追问。")
@@ -483,13 +550,43 @@ async def process_question_async(
         history = conversation_store.recent_history(
             sender_id, file_id, max_turns=settings.qa_history_max_turns
         )
+
+        # 检索：优先向量语义检索（解决中英混排跨语言失配），失败/无缓存回退关键词检索。
+        context = None
+        retrieval_mode = "keyword"
+        cached_chunks = load_cached_embeddings(
+            settings.qa_embedding_cache_dir, best.get("file_hash") or ""
+        )
+        if cached_chunks:
+            try:
+                context = await retrieve_by_embedding(
+                    question=question,
+                    chunks=cached_chunks,
+                    provider=provider,
+                    model=settings.qa_embedding_model,
+                    top_k=settings.qa_retrieve_top_k,
+                    max_chars=settings.qa_context_max_chars,
+                )
+                retrieval_mode = "embedding"
+            except Exception:
+                logger.exception(
+                    "[QA] embedding retrieval failed, fallback to keyword | %s", message_id
+                )
+                context = None
+        if context is None:
+            context = retrieve_pages(
+                question,
+                pages,
+                top_k=settings.qa_retrieve_top_k,
+                max_chars=settings.qa_context_max_chars,
+            )
+
         result = await answer_question(
             question=question,
-            pages=pages,
+            context=context,
             history=history,
             provider=provider,
-            top_k=settings.qa_retrieve_top_k,
-            max_chars=settings.qa_context_max_chars,
+            retrieval_mode=retrieval_mode,
         )
         conversation_store.append_history(
             sender_id,
