@@ -32,7 +32,6 @@ class Settings(BaseSettings):
     llm_provider: str = "qwen"
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     llm_api_key: str = ""
-    llm_app_id: str = ""
     llm_model: str = "qwen-plus"
     llm_timeout_ms: int = 180_000
     llm_max_tokens: int = 4000
