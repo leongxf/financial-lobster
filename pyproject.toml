@@ -11,6 +11,8 @@ dependencies = [
     "python-json-logger",
     "lark-oapi",
     "pypdf",
+    "python-docx",
+    "openpyxl",
 ]
 
 [project.optional-dependencies]

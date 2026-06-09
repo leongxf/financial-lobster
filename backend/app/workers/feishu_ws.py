@@ -256,18 +256,25 @@ async def process_file_message_async(
                 task_id,
                 status="failed",
                 event="no extractable text",
-                error="PDF has no extractable text layer",
+                error=f"{document.file_type} has no extractable text",
             )
+            if document.file_type == "pdf":
+                reason = "该文件很可能是扫描件或图片型 PDF，当前 MVP 暂未接入 OCR。"
+                suggestion = "请上传带文本层的 PDF，或先将扫描件转换为可搜索 PDF 后重试。"
+            else:
+                reason = "该文件可能为空，或不包含可提取的文本/表格内容。"
+                suggestion = "请确认文件内容非空后重试。"
             await notify(
                 "\n".join(
                     [
-                        "处理停止：未能从 PDF 中提取到可复制文本。",
+                        "处理停止：未能从文件中提取到可用文本。",
                         "",
                         f"- 文件：{downloaded_path.name}",
+                        f"- 文件类型：{document.file_type}",
                         f"- 页数：{page_info}",
-                        "- 原因：该文件很可能是扫描件或图片型 PDF，当前 MVP 暂未接入 OCR。",
+                        f"- 原因：{reason}",
                         "",
-                        "建议：请上传带文本层的 PDF，或先将扫描件转换为可搜索 PDF 后重试。",
+                        f"建议：{suggestion}",
                     ]
                 )
             )
