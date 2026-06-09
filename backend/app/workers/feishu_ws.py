@@ -45,6 +45,47 @@ def format_model_info(settings: Settings) -> str:
     return "未配置 LLM（仅文本提取预览）"
 
 
+async def suggest_followup_question(
+    provider: LLMProvider,
+    *,
+    report: str,
+    keywords: list[str],
+) -> str | None:
+    """基于已生成的财务摘要，让模型给出一个用户最可能追问的问题。
+
+    用 report（已是对文件内容的概括）作为输入既准确又省 token；
+    失败或返回为空时返回 None，由调用方回退到通用引导文案，不阻断主流程。
+    """
+    context = report.strip()[:2000]
+    keyword_hint = "、".join(keywords[:10]) if keywords else "无"
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是一个财务文件助手。根据给定的财务摘要，"
+                "推测用户最可能对该文件追问的一个问题。"
+                "要求：只输出这一个问题本身，不要解释、不要引号、不要编号，"
+                "问题需具体、与文件内容强相关，控制在 30 字以内。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"文件关键词：{keyword_hint}\n\n"
+                f"财务摘要：\n{context}\n\n"
+                "请给出一个用户最可能提出的问题："
+            ),
+        },
+    ]
+    try:
+        result = await provider.complete(messages)
+    except Exception:
+        logger.exception("failed to generate followup question suggestion")
+        return None
+    question = result.content.strip().splitlines()[0].strip().strip("「」\"'") if result.content.strip() else ""
+    return question or None
+
+
 def build_ack_message(settings: Settings, file_name: str | None) -> str:
     display_name = file_name or "未命名文件"
     return "\n".join(
@@ -376,8 +417,17 @@ async def process_file_message_async(
                 file_hash=file_hash,
                 embeddings_path=embeddings_path,
             )
+            example_question = "营业收入是多少"
+            if settings.llm_api_key:
+                suggested = await suggest_followup_question(
+                    provider,
+                    report=report,
+                    keywords=keywords,
+                )
+                if suggested:
+                    example_question = suggested
             await notify(
-                "你现在可以直接发文字向我追问这个文件的内容，例如「营业收入是多少」。"
+                f"你现在可以直接发文字向我追问这个文件的内容，例如「{example_question}」。"
             )
     except httpx.ReadTimeout:
         logger.exception("LLM timeout while processing file message %s", message_id)
