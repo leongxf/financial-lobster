@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -13,7 +14,16 @@ class TextChunk:
     index: int
     start_page: int
     end_page: int
+    page_count: int
     text: str
+
+
+@dataclass(frozen=True)
+class ChunkPlan:
+    chunks: list["TextChunk"]
+    analyzed_pages: int
+    total_pages: int
+    truncated: bool
 
 
 @dataclass(frozen=True)
@@ -22,6 +32,9 @@ class FinancialSummaryResult:
     usage: TokenUsage
     cache_hits: int = 0
     cache_misses: int = 0
+    analyzed_pages: int = 0
+    total_pages: int = 0
+    truncated: bool = False
 
 
 SYSTEM_PROMPT = """你是服务于四大投资建议/交易咨询人员的材料分析助理。
@@ -37,19 +50,41 @@ SYSTEM_PROMPT = """你是服务于四大投资建议/交易咨询人员的材料
 """
 
 
+MERGE_PROMPT = """请把以下多段「材料整理结果」合并为一段连贯的整理结果。
+
+要求：
+- 保留每条信息的来源页码标记（如「[第 X 页]」「第 X 页」）。
+- 不要臆造、不要补全原文没有的信息。
+- 不要丢弃客观数据；同类指标可归并罗列，但不得删除不同期间/主体/来源页的数值。
+- 只做合并与组织，不要新增结论或投资建议。
+- 输出中文 Markdown 片段（不需要完整报告结构）。
+
+待合并的整理结果：
+{notes}
+"""
+
+
 def build_chunks(
     pages: list[ParsedPage],
     chunk_chars: int,
+    max_pages: int,
     max_chunks: int,
-) -> list[TextChunk]:
+) -> ChunkPlan:
+    """把逻辑页打包成分析片段，按页数封顶（不切断单页）。
+
+    页数才是绑定约束：只取前 max_pages 个有内容的页参与分析，超出部分不丢失地标记为
+    truncated，由上层在报告中显式提示。max_chunks 仅作防跑飞硬上限。
+    """
+    non_empty = [page for page in pages if page.text.strip()]
+    total_pages = len(non_empty)
+    budget = non_empty[:max_pages] if max_pages > 0 else non_empty
+
     chunks: list[TextChunk] = []
     current_pages: list[ParsedPage] = []
     current_len = 0
 
-    for page in pages:
+    for page in budget:
         text = page.text.strip()
-        if not text:
-            continue
 
         if current_pages and current_len + len(text) > chunk_chars:
             chunks.append(_make_chunk(len(chunks) + 1, current_pages))
@@ -65,93 +100,224 @@ def build_chunks(
     if current_pages and len(chunks) < max_chunks:
         chunks.append(_make_chunk(len(chunks) + 1, current_pages))
 
-    return chunks
+    analyzed_pages = sum(chunk.page_count for chunk in chunks)
+    return ChunkPlan(
+        chunks=chunks,
+        analyzed_pages=analyzed_pages,
+        total_pages=total_pages,
+        truncated=analyzed_pages < total_pages,
+    )
 
 
 def _make_chunk(index: int, pages: list[ParsedPage]) -> TextChunk:
     start_page = pages[0].page_number
     end_page = pages[-1].page_number
     text = "\n\n".join(f"[第 {page.page_number} 页]\n{page.text}" for page in pages)
-    return TextChunk(index=index, start_page=start_page, end_page=end_page, text=text)
+    return TextChunk(
+        index=index,
+        start_page=start_page,
+        end_page=end_page,
+        page_count=len(pages),
+        text=text,
+    )
 
 
 async def generate_financial_summary_markdown(
     document: ParsedDocument,
     provider: LLMProvider,
     chunk_chars: int,
+    max_pages: int,
     max_chunks: int,
     prompt_version: str,
     file_hash: str,
+    reduce_group_size: int,
+    map_concurrency: int,
     cache: AnalysisCache | None = None,
     on_progress: ProgressCallback = None,
 ) -> FinancialSummaryResult:
-    chunks = build_chunks(document.pages, chunk_chars=chunk_chars, max_chunks=max_chunks)
+    plan = build_chunks(
+        document.pages,
+        chunk_chars=chunk_chars,
+        max_pages=max_pages,
+        max_chunks=max_chunks,
+    )
+    chunks = plan.chunks
     if not chunks:
         return FinancialSummaryResult(
             markdown=_empty_text_report(document),
             usage=TokenUsage(),
+            total_pages=plan.total_pages,
         )
 
-    chunk_notes: list[str] = []
-    usage = TokenUsage()
-    cache_hits = 0
-    cache_misses = 0
     total = len(chunks)
-    for chunk in chunks:
-        cached = None
-        cache_key = None
-        if cache is not None:
-            cache_key = ChunkCacheKey(
-                provider=provider.config.provider,
-                model=provider.config.model,
-                prompt_version=prompt_version,
-                chunk_chars=chunk_chars,
-                max_tokens=provider.config.max_tokens,
-                temperature=provider.config.temperature,
-                file_hash=file_hash,
-                chunk_index=chunk.index,
-                chunk_hash=sha256_text(chunk.text),
+    sem = asyncio.Semaphore(max(1, map_concurrency))
+
+    def make_key(chunk: TextChunk) -> ChunkCacheKey | None:
+        if cache is None:
+            return None
+        return ChunkCacheKey(
+            provider=provider.config.provider,
+            model=provider.config.model,
+            prompt_version=prompt_version,
+            chunk_chars=chunk_chars,
+            max_tokens=provider.config.max_tokens,
+            temperature=provider.config.temperature,
+            file_hash=file_hash,
+            chunk_index=chunk.index,
+            chunk_hash=sha256_text(chunk.text),
+        )
+
+    # Map：每个片段并发分析（受 map_concurrency 限流），保留缓存与进度。
+    map_results = await asyncio.gather(
+        *(
+            _map_one(
+                chunk,
+                provider,
+                cache,
+                make_key(chunk),
+                sem,
+                on_progress,
+                total,
+                document.file_path.name,
             )
-            cached = cache.get_chunk(cache_key)
+            for chunk in chunks
+        )
+    )
 
+    chunk_notes = [result.markdown for result, _ in map_results]
+    usage = TokenUsage()
+    for result, _ in map_results:
+        usage += result.usage
+    cache_hits = sum(1 for _, hit in map_results if hit)
+    cache_misses = total - cache_hits
+
+    # Reduce：分层归并，避免一次性把所有片段笔记塞进单次合成。
+    reduced = await reduce_notes(
+        document,
+        chunk_notes,
+        provider,
+        group_size=reduce_group_size,
+        chunk_count=total,
+        concurrency=map_concurrency,
+        on_progress=on_progress,
+    )
+
+    markdown = reduced.markdown
+    if plan.truncated:
+        markdown = _truncation_notice(plan, max_pages) + markdown
+
+    return FinancialSummaryResult(
+        markdown=markdown,
+        usage=usage + reduced.usage,
+        cache_hits=cache_hits,
+        cache_misses=cache_misses,
+        analyzed_pages=plan.analyzed_pages,
+        total_pages=plan.total_pages,
+        truncated=plan.truncated,
+    )
+
+
+async def _map_one(
+    chunk: TextChunk,
+    provider: LLMProvider,
+    cache: AnalysisCache | None,
+    cache_key: ChunkCacheKey | None,
+    sem: asyncio.Semaphore,
+    on_progress: ProgressCallback,
+    total: int,
+    source_file: str,
+) -> tuple[FinancialSummaryResult, bool]:
+    if cache is not None and cache_key is not None:
+        cached = cache.get_chunk(cache_key)
         if cached is not None:
-            cache_hits += 1
             if on_progress:
-                await on_progress(
-                    f"片段 {chunk.index}/{total} 命中缓存，跳过模型调用。"
-                )
-            chunk_notes.append(cached.markdown)
-            continue
+                await on_progress(f"片段 {chunk.index}/{total} 命中缓存，跳过模型调用。")
+            return FinancialSummaryResult(markdown=cached.markdown, usage=TokenUsage()), True
 
-        cache_misses += 1
+    async with sem:
+        if on_progress:
+            pages = f"第 {chunk.start_page}-{chunk.end_page} 页"
+            await on_progress(f"正在分析片段 {chunk.index}/{total}（{pages}）...")
+        result = await summarize_chunk(chunk, provider)
+
+    if cache is not None and cache_key is not None:
+        cache.set_chunk(
+            cache_key,
+            markdown=result.markdown,
+            usage=result.usage,
+            metadata={
+                "source_file": source_file,
+                "start_page": chunk.start_page,
+                "end_page": chunk.end_page,
+            },
+        )
+    return result, False
+
+
+async def reduce_notes(
+    document: ParsedDocument,
+    notes: list[str],
+    provider: LLMProvider,
+    group_size: int,
+    chunk_count: int,
+    concurrency: int,
+    on_progress: ProgressCallback = None,
+) -> FinancialSummaryResult:
+    """分层归并：笔记数超过 group_size 时先分组合并成章节小结，逐层收敛后再做最终合成。"""
+    usage = TokenUsage()
+    group_size = max(2, group_size)
+    level = 0
+
+    while len(notes) > group_size:
+        level += 1
+        groups = [notes[i : i + group_size] for i in range(0, len(notes), group_size)]
         if on_progress:
             await on_progress(
-                f"正在分析片段 {chunk.index}/{total}（第 {chunk.start_page}-{chunk.end_page} 页）..."
+                f"正在分层归并（第 {level} 层，{len(notes)} 段 → {len(groups)} 组）..."
             )
-        chunk_result = await summarize_chunk(chunk, provider)
-        chunk_notes.append(chunk_result.markdown)
-        usage += chunk_result.usage
-        if cache is not None and cache_key is not None:
-            cache.set_chunk(
-                cache_key,
-                markdown=chunk_result.markdown,
-                usage=chunk_result.usage,
-                metadata={
-                    "source_file": document.file_path.name,
-                    "start_page": chunk.start_page,
-                    "end_page": chunk.end_page,
-                },
-            )
+        sem = asyncio.Semaphore(max(1, concurrency))
+        merged = await asyncio.gather(
+            *(_merge_group(group, provider, sem) for group in groups)
+        )
+        notes = [result.markdown for result in merged]
+        for result in merged:
+            usage += result.usage
 
     if on_progress:
         await on_progress("正在合成最终 Markdown 报告...")
 
-    final_result = await synthesize_final_report(document, chunk_notes, provider, len(chunks))
+    final_result = await synthesize_final_report(document, notes, provider, chunk_count)
     return FinancialSummaryResult(
         markdown=final_result.markdown,
         usage=usage + final_result.usage,
-        cache_hits=cache_hits,
-        cache_misses=cache_misses,
+    )
+
+
+async def _merge_group(
+    notes: list[str],
+    provider: LLMProvider,
+    sem: asyncio.Semaphore,
+) -> FinancialSummaryResult:
+    if len(notes) == 1:
+        return FinancialSummaryResult(markdown=notes[0], usage=TokenUsage())
+    joined = "\n\n---\n\n".join(
+        f"## 待合并整理 {index + 1}\n{note}" for index, note in enumerate(notes)
+    )
+    user_prompt = MERGE_PROMPT.format(notes=joined)
+    async with sem:
+        result = await provider.complete(
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ]
+        )
+    return FinancialSummaryResult(markdown=result.content, usage=result.usage)
+
+
+def _truncation_notice(plan: ChunkPlan, max_pages: int) -> str:
+    return (
+        f"> ⚠️ 本文件共 {plan.total_pages} 页，受 `llm_max_pages={max_pages}` 限制，"
+        f"本报告仅分析了前 {plan.analyzed_pages} 页。后续追问检索仍覆盖全文。\n\n"
     )
 
 
