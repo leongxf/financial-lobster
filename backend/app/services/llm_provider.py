@@ -71,7 +71,7 @@ class LLMProvider:
                             "max_tokens": self.config.max_tokens,
                         },
                     )
-                    response.raise_for_status()
+                    _raise_for_status_with_body(response, url)
                     data = response.json()
                 break
             except httpx.ReadTimeout as exc:
@@ -131,7 +131,7 @@ class LLMProvider:
                         },
                         json={"model": model, "input": texts},
                     )
-                    response.raise_for_status()
+                    _raise_for_status_with_body(response, url)
                     data = response.json()
                 break
             except httpx.ReadTimeout as exc:
@@ -156,6 +156,26 @@ class LLMProvider:
         # 按 index 排序，确保与入参顺序对齐。
         items.sort(key=lambda it: int(it.get("index") or 0))
         return [list(it.get("embedding") or []) for it in items]
+
+
+def _raise_for_status_with_body(response: httpx.Response, url: str) -> None:
+    """raise_for_status 默认不带响应体；这里把服务端的错误正文记日志并带进异常消息。
+
+    dashscope 等服务的 4xx 响应体通常包含真正原因（如输入超长、参数非法、内容拦截），
+    缺了它根本无法定位。4xx 是客户端错误，重试无意义，交由上层不再重试地抛出。
+    """
+    if response.status_code < 400:
+        return
+    body = response.text
+    logger.error(
+        "LLM 调用返回 HTTP %s | url=%s | body=%s",
+        response.status_code,
+        url,
+        body[:2000],
+    )
+    raise RuntimeError(
+        f"LLM 调用失败（HTTP {response.status_code}）：{body[:500]}"
+    )
 
 
 def _parse_usage(raw_usage: dict) -> TokenUsage:
