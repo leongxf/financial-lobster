@@ -20,7 +20,7 @@ from app.services.conversation_store import ConversationStore
 from app.services.document_parser import parse_document
 from app.services.event_dedup import EventDeduplicator
 from app.services.financial_summary import generate_financial_summary_markdown
-from app.services.llm_provider import LLMConfig, LLMProvider, TokenUsage
+from app.services.llm_provider import LLMConfig, LLMError, LLMProvider, TokenUsage
 from app.services.markdown_report import build_parse_preview_report
 from app.services.qa_service import (
     answer_question,
@@ -377,22 +377,19 @@ async def process_file_message_async(
                 event="calling LLM",
                 prompt_version=settings.prompt_version,
                 llm_chunk_chars=settings.llm_chunk_chars,
-                llm_max_pages=settings.llm_max_pages,
+                llm_max_chunks=settings.llm_max_chunks,
             )
             await notify(
                 f"开始调用模型 {settings.llm_model} 分析"
-                f"（最多分析 {settings.llm_max_pages} 页）..."
+                f"（最多 {settings.llm_max_chunks} 个片段）..."
             )
             summary_result = await generate_financial_summary_markdown(
                 document=document,
                 provider=provider,
                 chunk_chars=settings.llm_chunk_chars,
-                max_pages=settings.llm_max_pages,
                 max_chunks=settings.llm_max_chunks,
                 prompt_version=settings.prompt_version,
                 file_hash=file_hash,
-                reduce_group_size=settings.llm_reduce_group_size,
-                map_concurrency=settings.llm_map_concurrency,
                 cache=analysis_cache,
                 on_progress=notify,
             )
@@ -400,13 +397,6 @@ async def process_file_message_async(
             usage = summary_result.usage
             cache_hits = summary_result.cache_hits
             cache_misses = summary_result.cache_misses
-            if summary_result.truncated:
-                await notify(
-                    f"提示：文件共 {summary_result.total_pages} 页，"
-                    f"本次报告仅分析了前 {summary_result.analyzed_pages} 页"
-                    f"（受最大分析页数 {settings.llm_max_pages} 限制）。"
-                    "后续追问检索仍覆盖全文。"
-                )
         else:
             await notify("未配置 LLM_API_KEY，返回解析预览。")
             report = build_parse_preview_report(document)
@@ -536,6 +526,22 @@ async def process_file_message_async(
             f"当前超时设置 {settings.llm_timeout_ms // 1000} 秒，"
             "大文件可在 .env 调大 LLM_TIMEOUT_MS 或减少 LLM_MAX_CHUNKS 后重试。"
         )
+    except LLMError as exc:
+        # 平台类错误（欠费/鉴权/限流等）：给用户可执行的友好提示，原始 body 仅入日志。
+        logger.error(
+            "LLM error while processing file message %s | category=%s | status=%s | body=%s",
+            message_id,
+            exc.category,
+            exc.status_code,
+            exc.body[:500],
+        )
+        task_store.update_task(
+            task_id,
+            status="failed",
+            event=f"LLM error: {exc.category}",
+            error=str(exc),
+        )
+        await notify(str(exc))
     except Exception as exc:
         logger.exception("failed to process file message %s", message_id)
         task_store.update_task(
@@ -750,6 +756,15 @@ async def process_question_async(
     except httpx.ReadTimeout:
         logger.exception("LLM timeout while answering question %s", message_id)
         await notify("回答超时，请稍后重试，或缩短问题后再试。")
+    except LLMError as exc:
+        logger.error(
+            "LLM error while answering question %s | category=%s | status=%s | body=%s",
+            message_id,
+            exc.category,
+            exc.status_code,
+            exc.body[:500],
+        )
+        await notify(str(exc))
     except Exception as exc:
         logger.exception("failed to answer question %s", message_id)
         await notify(f"回答失败：{exc}")
