@@ -37,14 +37,7 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 4000
     llm_temperature: float = 0.2
     llm_chunk_chars: int = 18_000
-    # 分析页数上限：绑定约束，超出则截断并在报告中显式提示，避免静默丢页。
-    llm_max_pages: int = 200
-    # 分层归并时每组合并的分片笔记数；笔记超过该数则先分组归并再终合，避免一次性 reduce 爆上下文。
-    llm_reduce_group_size: int = 8
-    # map 阶段并发调用数（qwen 接口有速率限制，默认保守）。
-    llm_map_concurrency: int = 4
-    # 防跑飞硬上限：页数才是真正的限制，这里给一个高位兜底。
-    llm_max_chunks: int = 200
+    llm_max_chunks: int = 12
     prompt_version: str = "material_financial_summary:v1"
 
     # 追问问答（多轮对话）相关配置。
