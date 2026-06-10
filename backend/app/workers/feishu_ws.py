@@ -377,19 +377,22 @@ async def process_file_message_async(
                 event="calling LLM",
                 prompt_version=settings.prompt_version,
                 llm_chunk_chars=settings.llm_chunk_chars,
-                llm_max_chunks=settings.llm_max_chunks,
+                llm_max_pages=settings.llm_max_pages,
             )
             await notify(
                 f"开始调用模型 {settings.llm_model} 分析"
-                f"（最多 {settings.llm_max_chunks} 个片段）..."
+                f"（最多分析 {settings.llm_max_pages} 页）..."
             )
             summary_result = await generate_financial_summary_markdown(
                 document=document,
                 provider=provider,
                 chunk_chars=settings.llm_chunk_chars,
+                max_pages=settings.llm_max_pages,
                 max_chunks=settings.llm_max_chunks,
                 prompt_version=settings.prompt_version,
                 file_hash=file_hash,
+                reduce_group_size=settings.llm_reduce_group_size,
+                map_concurrency=settings.llm_map_concurrency,
                 cache=analysis_cache,
                 on_progress=notify,
             )
@@ -397,6 +400,13 @@ async def process_file_message_async(
             usage = summary_result.usage
             cache_hits = summary_result.cache_hits
             cache_misses = summary_result.cache_misses
+            if summary_result.truncated:
+                await notify(
+                    f"提示：文件共 {summary_result.total_pages} 页，"
+                    f"本次报告仅分析了前 {summary_result.analyzed_pages} 页"
+                    f"（受最大分析页数 {settings.llm_max_pages} 限制）。"
+                    "后续追问检索仍覆盖全文。"
+                )
         else:
             await notify("未配置 LLM_API_KEY，返回解析预览。")
             report = build_parse_preview_report(document)
