@@ -1,16 +1,25 @@
 import json
+import time
 from pathlib import Path
 
 import httpx
 
 
 class FeishuClient:
+    # 进程级 token 缓存（按 app_id 共享于所有实例）。客户端按消息新建，若不缓存则每条
+    # 回复/进度都要现拉一次 token，长文件会瞬间把大量连接砸向飞书 auth 接口（引发 ConnectTimeout）。
+    _token_cache: dict[str, tuple[str, float]] = {}
+
     def __init__(self, app_id: str, app_secret: str) -> None:
         self.app_id = app_id
         self.app_secret = app_secret
         self.base_url = "https://open.feishu.cn/open-apis"
 
     async def get_tenant_access_token(self) -> str:
+        cached = self._token_cache.get(self.app_id)
+        if cached is not None and time.time() < cached[1]:
+            return cached[0]
+
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(
                 f"{self.base_url}/auth/v3/tenant_access_token/internal",
@@ -24,6 +33,9 @@ class FeishuClient:
             token = data.get("tenant_access_token")
             if not token:
                 raise RuntimeError(f"获取 tenant access token 失败：{data}")
+            # 飞书返回 expire（秒，通常 7200）；提前 60s 过期，留刷新缓冲。
+            expire = int(data.get("expire") or 7200)
+            self._token_cache[self.app_id] = (token, time.time() + max(60, expire - 60))
             return token
 
     async def send_text(
