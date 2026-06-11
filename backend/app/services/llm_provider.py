@@ -6,6 +6,12 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# 续写指令：上文因长度被截断时，要求模型从中断处接着输出且不重复已有内容，便于各轮直接拼接。
+_CONTINUE_PROMPT = (
+    "你上一条回复因长度限制被截断了。请从中断处继续输出剩余内容："
+    "直接接着写，不要重复任何已经输出过的内容，不要重复标题或表头，不要加任何前言。"
+)
+
 
 @dataclass(frozen=True)
 class LLMConfig:
@@ -36,6 +42,8 @@ class TokenUsage:
 class LLMResult:
     content: str
     usage: TokenUsage
+    # 模型停止原因："stop"=正常结束；"length"=因 max_tokens 截断（需续写补全）。
+    finish_reason: str = "stop"
 
 
 class LLMError(RuntimeError):
@@ -234,7 +242,50 @@ class LLMProvider:
         if not content:
             raise RuntimeError(f"LLM 响应缺少 content：{data}")
 
-        return LLMResult(content=content, usage=_parse_usage(data.get("usage") or {}))
+        finish_reason = str(choices[0].get("finish_reason") or "stop")
+        return LLMResult(
+            content=content,
+            usage=_parse_usage(data.get("usage") or {}),
+            finish_reason=finish_reason,
+        )
+
+    async def complete_until_done(
+        self,
+        messages: list[dict[str, str]],
+        max_rounds: int = 20,
+    ) -> LLMResult:
+        """完整生成：因 max_tokens 截断（finish_reason=="length"）时自动续写并拼接。
+
+        通用于任意内容形态（长表格/长叙述/长清单）与任意文件类型——只看 finish_reason，
+        在中断处续写直到模型正常结束（"stop"）或达到 max_rounds 上限。
+        续写时把已生成内容作为 assistant 轮回填，并要求"接着写、不重复"，故各轮直接拼接即可。
+        注意：回填的已生成内容会逐轮增大输入；max_rounds 同时作为防跑飞与防输入超限的硬上限。
+        """
+        parts: list[str] = []
+        usage = TokenUsage()
+        finish_reason = "stop"
+        for round_index in range(max(1, max_rounds)):
+            convo = list(messages)
+            accumulated = "".join(parts)
+            if accumulated:
+                convo.append({"role": "assistant", "content": accumulated})
+                convo.append({"role": "user", "content": _CONTINUE_PROMPT})
+            result = await self.complete(convo)
+            parts.append(result.content)
+            usage += result.usage
+            finish_reason = result.finish_reason
+            if finish_reason != "length":
+                break
+            logger.info(
+                "complete_until_done: 第 %s 轮因长度截断，继续续写", round_index + 1
+            )
+        else:
+            logger.warning(
+                "complete_until_done 达到 max_rounds=%s 仍被截断，输出可能不完整", max_rounds
+            )
+        return LLMResult(
+            content="".join(parts), usage=usage, finish_reason=finish_reason
+        )
 
     async def embed(
         self,

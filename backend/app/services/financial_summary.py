@@ -348,7 +348,7 @@ async def _merge_group(
     )
     user_prompt = MERGE_PROMPT.format(notes=joined)
     async with sem:
-        result = await provider.complete(
+        result = await provider.complete_until_done(
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
@@ -421,7 +421,7 @@ async def synthesize_final_report(
 分片整理结果：
 {notes}
 """
-    result = await provider.complete(
+    result = await provider.complete_until_done(
         [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},

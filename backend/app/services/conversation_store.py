@@ -111,6 +111,20 @@ class ConversationStore:
             data["current_file_id"] = self._most_recent_file_id(files)
         self.write(open_id, data)
 
+    def update_embeddings_path(self, open_id: str, entry_key: str, embeddings_path: str) -> None:
+        """仅补写指定文件画像的 embeddings_path（向量算完后调用）。
+
+        文件在报告发出后即以空 embeddings_path 登记，确保用户能立即追问（先走关键词检索）；
+        待后台 embedding 算完再用本方法补写路径，无缝升级为向量检索。只动单字段，不重置
+        last_active_at / current_file_id，避免覆盖期间用户追问产生的状态。
+        """
+        data = self.read(open_id)
+        entry = data.get("files", {}).get(entry_key)
+        if entry is None:
+            return
+        entry["embeddings_path"] = embeddings_path
+        self.write(open_id, data)
+
     def touch_file(self, open_id: str, file_id: str) -> None:
         data = self.read(open_id)
         files = data.get("files", {})

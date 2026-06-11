@@ -463,9 +463,24 @@ async def process_file_message_async(
                 safe_name,
             )
 
+            # 先登记文件（embeddings_path 暂空），确保报告发出后用户能立即追问：
+            # 向量未就绪时 process_question_async 会自动回退关键词检索。否则文件要等下方
+            # 整篇 embedding 算完才登记，期间追问会误报"还没有最近上传的文件"。
+            entry_key = file_hash or task_id
+            conversation_store.upsert_file(
+                sender_id,
+                file_id=task_id,
+                file_name=file_name,
+                pages_path=str(pages_path),
+                summary=summary_line[:200],
+                keywords=keywords,
+                file_hash=file_hash,
+                embeddings_path="",
+            )
+
             # 预计算向量（embedding）供追问做语义检索；中英混排材料靠它解决跨语言检索。
-            # 按 file_hash 缓存：同内容文件重传直接复用，不重算。失败不阻断主流程。
-            embeddings_path = ""
+            # 按 file_hash 缓存：同内容文件重传直接复用，不重算。算完后补写 embeddings_path
+            # 升级为向量检索；失败不阻断主流程（仍可关键词检索）。
             if settings.llm_api_key:
                 cache_dir = settings.qa_embedding_cache_dir
                 try:
@@ -508,24 +523,15 @@ async def process_file_message_async(
                             file_hash,
                             len(cached),
                         )
-                    embeddings_path = str(embedding_cache_file(cache_dir, file_hash))
+                    conversation_store.update_embeddings_path(
+                        sender_id, entry_key, str(embedding_cache_file(cache_dir, file_hash))
+                    )
                 except Exception:
                     logger.exception(
                         "[QA] failed to build embeddings for %s, fallback to keyword retrieval",
                         file_hash,
                     )
-                    embeddings_path = ""
 
-            conversation_store.upsert_file(
-                sender_id,
-                file_id=task_id,
-                file_name=file_name,
-                pages_path=str(pages_path),
-                summary=summary_line[:200],
-                keywords=keywords,
-                file_hash=file_hash,
-                embeddings_path=embeddings_path,
-            )
             example_question = "营业收入是多少"
             if settings.llm_api_key:
                 suggested = await suggest_followup_question(
@@ -698,7 +704,10 @@ async def process_question_async(
 
     files = conversation_store.list_files(sender_id)
     if not files:
-        await notify("我还没有你最近上传的文件，请先发送一个 PDF 给我分析后再追问。")
+        await notify(
+            "我还没有你最近上传的文件，请先发送一个文件"
+            "（支持 PDF / Word / Excel / CSV）给我分析后再追问。"
+        )
         return
 
     # 第一级：按关键字重合度在最近文件中选最相关的；都不命中则用当前（最近活跃）文件。
