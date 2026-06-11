@@ -227,7 +227,13 @@ async def process_file_message_async(
     target_path = storage_dir / safe_name
 
     async def notify(text: str) -> None:
-        await client.reply_text(message_id, text)
+        # 进度通知是尽力而为：飞书瞬时网络抖动导致的发送失败不应中断已在进行的分析。
+        try:
+            await client.reply_text(message_id, text)
+        except Exception:
+            logger.warning(
+                "failed to send progress notification for %s", message_id, exc_info=True
+            )
 
     try:
         task_store.create_task(
