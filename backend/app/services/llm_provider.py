@@ -208,12 +208,15 @@ class LLMProvider:
                     _raise_for_status_with_body(response)
                     data = response.json()
                 break
-            except httpx.ReadTimeout as exc:
+            except httpx.TransportError as exc:
+                # 涵盖连接超时(ConnectTimeout)/读超时(ReadTimeout)/连接错误等瞬时传输层故障，
+                # 这些都值得重试；已分类的 LLMError 继承自 RuntimeError，不会落到这里。
                 last_error = exc
                 if attempt >= max_retries:
                     raise
                 logger.warning(
-                    "LLM read timeout, retrying %s/%s",
+                    "LLM request transport error (%s), retrying %s/%s",
+                    type(exc).__name__,
                     attempt + 1,
                     max_retries,
                 )
@@ -268,12 +271,14 @@ class LLMProvider:
                     _raise_for_status_with_body(response)
                     data = response.json()
                 break
-            except httpx.ReadTimeout as exc:
+            except httpx.TransportError as exc:
+                # 同 complete：连接超时等瞬时传输层故障也纳入重试。
                 last_error = exc
                 if attempt >= max_retries:
                     raise
                 logger.warning(
-                    "Embedding read timeout, retrying %s/%s",
+                    "Embedding request transport error (%s), retrying %s/%s",
+                    type(exc).__name__,
                     attempt + 1,
                     max_retries,
                 )
