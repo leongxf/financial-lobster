@@ -18,24 +18,22 @@ class CachedChunk:
 
 @dataclass(frozen=True)
 class ChunkCacheKey:
-    provider: str
-    model: str
+    """缓存命中标识：只描述「输入内容」，不含模型/调用参数。
+
+    刻意不把 provider/model/temperature/max_tokens 纳入 key，这样换模型仍能命中——
+    对「客观信息抽取」任务不同模型结果近似可互换。需要主动失效时 bump prompt_version。
+    """
+
     prompt_version: str
     chunk_chars: int
-    max_tokens: int
-    temperature: float
     file_hash: str
     chunk_index: int
     chunk_hash: str
 
     def digest(self) -> str:
         payload = {
-            "provider": self.provider,
-            "model": self.model,
             "prompt_version": self.prompt_version,
             "chunk_chars": self.chunk_chars,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
             "file_hash": self.file_hash,
             "chunk_index": self.chunk_index,
             "chunk_hash": self.chunk_hash,

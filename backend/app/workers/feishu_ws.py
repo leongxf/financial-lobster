@@ -20,13 +20,20 @@ from app.services.conversation_store import ConversationStore
 from app.services.document_parser import parse_document
 from app.services.event_dedup import EventDeduplicator
 from app.services.financial_summary import generate_financial_summary_markdown
-from app.services.llm_provider import LLMConfig, LLMError, LLMProvider, TokenUsage
+from app.services.llm_provider import (
+    LLMConfig,
+    LLMError,
+    LLMProvider,
+    TokenUsage,
+    build_chat_provider,
+)
 from app.services.markdown_report import build_parse_preview_report
 from app.services.qa_service import (
     answer_question,
     build_chunk_embeddings,
     embedding_cache_file,
     extract_keywords,
+    load_cached_embedding_model,
     load_cached_embeddings,
     load_pages,
     retrieve_by_embedding,
@@ -366,7 +373,7 @@ async def process_file_message_async(
         cache_hits = 0
         cache_misses = 0
         if settings.llm_api_key:
-            provider = LLMProvider(
+            provider = build_chat_provider(
                 LLMConfig(
                     provider=settings.llm_provider,
                     base_url=settings.llm_base_url,
@@ -375,7 +382,8 @@ async def process_file_message_async(
                     timeout_ms=settings.llm_timeout_ms,
                     max_tokens=settings.llm_max_tokens,
                     temperature=settings.llm_temperature,
-                )
+                ),
+                settings.fallback_models,
             )
             task_store.update_task(
                 task_id,
@@ -477,16 +485,16 @@ async def process_file_message_async(
                                 temperature=settings.llm_temperature,
                             )
                         )
-                        chunks = await build_chunk_embeddings(
+                        chunks, embedding_model_used = await build_chunk_embeddings(
                             pages_data,
                             provider=embed_provider,
-                            model=settings.qa_embedding_model,
+                            models=settings.embedding_model_chain,
                             chunk_chars=settings.qa_embedding_chunk_chars,
                             overlap=settings.qa_embedding_chunk_overlap,
                             batch_size=settings.qa_embedding_batch_size,
                         )
                         save_cached_embeddings(
-                            cache_dir, file_hash, chunks, settings.qa_embedding_model
+                            cache_dir, file_hash, chunks, embedding_model_used
                         )
                         logger.info(
                             "[QA] embeddings built | file_hash=%s | chunks=%d",
@@ -705,7 +713,7 @@ async def process_question_async(
         return
 
     try:
-        provider = LLMProvider(
+        provider = build_chat_provider(
             LLMConfig(
                 provider=settings.llm_provider,
                 base_url=settings.llm_base_url,
@@ -714,7 +722,8 @@ async def process_question_async(
                 timeout_ms=settings.llm_timeout_ms,
                 max_tokens=settings.llm_max_tokens,
                 temperature=settings.llm_temperature,
-            )
+            ),
+            settings.fallback_models,
         )
         history = conversation_store.recent_history(
             sender_id, file_id, max_turns=settings.qa_history_max_turns
@@ -727,12 +736,20 @@ async def process_question_async(
             settings.qa_embedding_cache_dir, best.get("file_hash") or ""
         )
         if cached_chunks:
+            # 查询必须用该文件入库时的 embedding 模型，否则向量空间错配；
+            # 若该模型此刻额度耗尽，retrieve 会抛错并回退到下方关键词检索。
+            cached_embedding_model = (
+                load_cached_embedding_model(
+                    settings.qa_embedding_cache_dir, best.get("file_hash") or ""
+                )
+                or settings.qa_embedding_model
+            )
             try:
                 context = await retrieve_by_embedding(
                     question=question,
                     chunks=cached_chunks,
                     provider=provider,
-                    model=settings.qa_embedding_model,
+                    model=cached_embedding_model,
                     top_k=settings.qa_retrieve_top_k,
                     max_chars=settings.qa_context_max_chars,
                 )

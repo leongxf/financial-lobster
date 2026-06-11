@@ -156,12 +156,8 @@ async def generate_financial_summary_markdown(
         if cache is None:
             return None
         return ChunkCacheKey(
-            provider=provider.config.provider,
-            model=provider.config.model,
             prompt_version=prompt_version,
             chunk_chars=chunk_chars,
-            max_tokens=provider.config.max_tokens,
-            temperature=provider.config.temperature,
             file_hash=file_hash,
             chunk_index=chunk.index,
             chunk_hash=sha256_text(chunk.text),
@@ -249,6 +245,8 @@ async def _map_one(
                 "source_file": source_file,
                 "start_page": chunk.start_page,
                 "end_page": chunk.end_page,
+                "provider": provider.config.provider,
+                "model": provider.config.model,
             },
         )
     return result, False

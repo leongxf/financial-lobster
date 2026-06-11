@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx
 
@@ -285,6 +285,68 @@ class LLMProvider:
         # 按 index 排序，确保与入参顺序对齐。
         items.sort(key=lambda it: int(it.get("index") or 0))
         return [list(it.get("embedding") or []) for it in items]
+
+
+class FallbackProvider(LLMProvider):
+    """同账号、按额度耗尽顺序切换模型的 chat provider。
+
+    主模型额度耗尽（LLMError.category == "billing"）时，永久切到下一个备用模型并重试；
+    其余错误（鉴权/限流/模型不存在/服务端等）不切换，直接上抛，避免把配置错误当额度问题。
+    所有候选共用同一账号（base_url/api_key），只是 model 不同，因此 embed 等沿用 base 配置即可。
+
+    备用模型列表为空时不会构造本类（见 build_chat_provider），退化为单模型：额度耗尽即报错。
+    """
+
+    def __init__(self, base_config: LLMConfig, fallback_models: list[str]) -> None:
+        seen = {base_config.model}
+        configs = [base_config]
+        for model in fallback_models:
+            if model and model not in seen:
+                seen.add(model)
+                configs.append(replace(base_config, model=model))
+        self._providers = [LLMProvider(config) for config in configs]
+        # 游标只前进不回退：已知耗尽的模型不再重撞（map 阶段并发，故加锁保护推进）。
+        self._cursor = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def config(self) -> LLMConfig:  # type: ignore[override]
+        return self._providers[self._cursor].config
+
+    async def complete(
+        self,
+        messages: list[dict[str, str]],
+        max_retries: int = 2,
+    ) -> LLMResult:
+        last_error: Exception | None = None
+        for index in range(self._cursor, len(self._providers)):
+            try:
+                return await self._providers[index].complete(messages, max_retries=max_retries)
+            except LLMError as exc:
+                last_error = exc
+                has_next = index + 1 < len(self._providers)
+                if exc.category == "billing" and has_next:
+                    async with self._lock:
+                        self._cursor = max(self._cursor, index + 1)
+                    logger.warning(
+                        "模型 %s 额度耗尽，切换到备用模型 %s",
+                        self._providers[index].config.model,
+                        self._providers[index + 1].config.model,
+                    )
+                    continue
+                raise
+        assert last_error is not None
+        raise last_error
+
+
+def build_chat_provider(
+    base_config: LLMConfig,
+    fallback_models: list[str],
+) -> LLMProvider:
+    """有备用模型则返回带额度切换的 FallbackProvider，否则返回单模型 LLMProvider。"""
+    if fallback_models:
+        return FallbackProvider(base_config, fallback_models)
+    return LLMProvider(base_config)
 
 
 def _parse_usage(raw_usage: dict) -> TokenUsage:

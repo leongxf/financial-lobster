@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     llm_api_key: str = ""
     llm_model: str = "qwen-plus"
+    # 备用模型列表（逗号分隔，同账号）：主模型额度耗尽时按序切换，让缓存跨模型保持命中。
+    # 留空 = 关闭 fallback，额度耗尽直接报错（切到付费固定模型后清空即可）。
+    llm_fallback_models: str = ""
     llm_timeout_ms: int = 180_000
     llm_max_tokens: int = 4000
     llm_temperature: float = 0.2
@@ -57,6 +60,10 @@ class Settings(BaseSettings):
 
     # 向量检索（embedding）相关配置。中英混排材料靠多语言 embedding 做语义检索。
     qa_embedding_model: str = "text-embedding-v3"  # dashscope 多语言向量模型。
+    # 备用 embedding 模型（逗号分隔，同账号）：入库时主模型额度耗尽则整文件改用下一个重算，
+    # 并把实际所用模型记入缓存；查询时强制用该文件入库时的模型，避免跨模型向量空间错配。
+    # 留空 = 关闭。注意：换 embedding 模型只影响新入库文件，旧缓存仍用各自记录的模型查询。
+    qa_embedding_fallback_models: str = ""
     qa_embedding_chunk_chars: int = 700  # 切块字符数：检索粒度，小于整页以提升命中精度。
     qa_embedding_chunk_overlap: int = 120  # 相邻块重叠字符，避免答案被切在块边界。
     qa_embedding_batch_size: int = 10  # 单次 embedding 请求的最大文本条数（接口上限）。
@@ -79,6 +86,20 @@ class Settings(BaseSettings):
     @property
     def max_file_size_bytes(self) -> int:
         return self.max_file_size_mb * 1024 * 1024
+
+    @property
+    def fallback_models(self) -> list[str]:
+        return [m.strip() for m in self.llm_fallback_models.split(",") if m.strip()]
+
+    @property
+    def embedding_model_chain(self) -> list[str]:
+        """入库时尝试的 embedding 模型顺序：主模型在前，备用依次在后（去重）。"""
+        chain = [self.qa_embedding_model]
+        for model in self.qa_embedding_fallback_models.split(","):
+            model = model.strip()
+            if model and model not in chain:
+                chain.append(model)
+        return chain
 
 
 @lru_cache

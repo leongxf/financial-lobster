@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from app.services.llm_provider import LLMProvider, TokenUsage
+from app.services.llm_provider import LLMError, LLMProvider, TokenUsage
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +122,21 @@ def load_cached_embeddings(cache_dir: str, file_hash: str) -> list[dict[str, Any
     return None
 
 
+def load_cached_embedding_model(cache_dir: str, file_hash: str) -> str | None:
+    """读取该文件入库时实际使用的 embedding 模型名；查询须用同一模型保证向量空间一致。"""
+    if not file_hash:
+        return None
+    path = embedding_cache_file(cache_dir, file_hash)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+    model = data.get("model")
+    return model if isinstance(model, str) and model else None
+
+
 def save_cached_embeddings(
     cache_dir: str,
     file_hash: str,
@@ -150,23 +165,39 @@ def _cosine(a: list[float], b: list[float]) -> float:
 async def build_chunk_embeddings(
     pages: list[dict[str, Any]],
     provider: LLMProvider,
-    model: str,
+    models: list[str],
     chunk_chars: int,
     overlap: int,
     batch_size: int,
-) -> list[dict[str, Any]]:
-    """切块并批量计算 embedding，返回 [{page_number, text, embedding}]。"""
+) -> tuple[list[dict[str, Any]], str]:
+    """切块并批量计算 embedding，返回 ([{page_number, text, embedding}], 实际所用模型名)。
+
+    按 models 顺序尝试：某模型额度耗尽（billing）时整文件改用下一个模型从头重算，
+    确保同一文件所有向量来自同一模型（不同模型维度/空间不可混用）。非额度类错误直接上抛。
+    """
     chunks = split_pages_into_chunks(pages, chunk_chars=chunk_chars, overlap=overlap)
     if not chunks:
-        return []
+        return [], (models[0] if models else "")
     texts = [c["text"] for c in chunks]
-    embeddings: list[list[float]] = []
-    for start in range(0, len(texts), max(1, batch_size)):
-        batch = texts[start : start + batch_size]
-        embeddings.extend(await provider.embed(batch, model=model))
-    for chunk, vector in zip(chunks, embeddings):
-        chunk["embedding"] = vector
-    return chunks
+
+    last_error: Exception | None = None
+    for model in models:
+        try:
+            embeddings: list[list[float]] = []
+            for start in range(0, len(texts), max(1, batch_size)):
+                batch = texts[start : start + batch_size]
+                embeddings.extend(await provider.embed(batch, model=model))
+            for chunk, vector in zip(chunks, embeddings):
+                chunk["embedding"] = vector
+            return chunks, model
+        except LLMError as exc:
+            last_error = exc
+            if exc.category == "billing":
+                logger.warning("embedding 模型 %s 额度耗尽，整文件改用下一个模型重算", model)
+                continue
+            raise
+    assert last_error is not None
+    raise last_error
 
 
 async def retrieve_by_embedding(
