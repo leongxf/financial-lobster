@@ -406,6 +406,7 @@ async def process_file_message_async(
                 prompt_version=settings.prompt_version,
                 file_hash=file_hash,
                 reduce_group_size=settings.llm_reduce_group_size,
+                reduce_max_chars=settings.llm_reduce_max_chars,
                 map_concurrency=settings.llm_map_concurrency,
                 cache=analysis_cache,
                 on_progress=notify,

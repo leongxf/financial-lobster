@@ -131,6 +131,7 @@ async def generate_financial_summary_markdown(
     prompt_version: str,
     file_hash: str,
     reduce_group_size: int,
+    reduce_max_chars: int,
     map_concurrency: int,
     cache: AnalysisCache | None = None,
     on_progress: ProgressCallback = None,
@@ -195,6 +196,7 @@ async def generate_financial_summary_markdown(
         group_size=reduce_group_size,
         chunk_count=total,
         concurrency=map_concurrency,
+        max_input_chars=reduce_max_chars,
         on_progress=on_progress,
     )
 
@@ -252,6 +254,37 @@ async def _map_one(
     return result, False
 
 
+# 拼接每段笔记时附加的标题/分隔符开销（如「## 待合并整理 N\n」与「\n\n---\n\n」），
+# 估算偏大以留安全余量。
+_NOTE_JOIN_OVERHEAD = 30
+
+
+def _notes_total_len(notes: list[str]) -> int:
+    return sum(len(note) + _NOTE_JOIN_OVERHEAD for note in notes)
+
+
+def _pack_groups(notes: list[str], group_size: int, max_chars: int) -> list[list[str]]:
+    """把笔记按「条数上限 group_size」和「拼接后字符预算 max_chars」双重约束打包成多组。
+
+    任一约束先到即开新组，确保每组拼起来不超出模型单次输入预算。
+    单段笔记本身受 map/merge 的 max_tokens 输出上限约束，不会超过 max_chars，故每组至少含 1 段。
+    """
+    groups: list[list[str]] = []
+    current: list[str] = []
+    current_len = 0
+    for note in notes:
+        note_len = len(note) + _NOTE_JOIN_OVERHEAD
+        if current and (len(current) >= group_size or current_len + note_len > max_chars):
+            groups.append(current)
+            current = []
+            current_len = 0
+        current.append(note)
+        current_len += note_len
+    if current:
+        groups.append(current)
+    return groups
+
+
 async def reduce_notes(
     document: ParsedDocument,
     notes: list[str],
@@ -259,16 +292,28 @@ async def reduce_notes(
     group_size: int,
     chunk_count: int,
     concurrency: int,
+    max_input_chars: int,
     on_progress: ProgressCallback = None,
 ) -> FinancialSummaryResult:
-    """分层归并：笔记数超过 group_size 时先分组合并成章节小结，逐层收敛后再做最终合成。"""
+    """分层归并：笔记数超过 group_size 或拼接后超出字符预算时，先分组合并，逐层收敛后再终合。
+
+    除条数外再按 max_input_chars 字符预算封顶，确保任何一次归并/合成调用的输入都不超过
+    模型输入长度上限（如 dashscope 30720）。
+    """
     usage = TokenUsage()
     group_size = max(2, group_size)
+    # 给最终合成的报告结构模板与文件元信息留余量，避免拼好的笔记 + 模板再次超限。
+    fit_budget = max(2000, max_input_chars - 2000)
     level = 0
 
-    while len(notes) > group_size:
+    while len(notes) > 1 and (
+        len(notes) > group_size or _notes_total_len(notes) > fit_budget
+    ):
+        groups = _pack_groups(notes, group_size, fit_budget)
+        if len(groups) >= len(notes):
+            # 无法进一步收敛（单段已接近预算上限），停止分层避免死循环，交给最终合成尽力而为。
+            break
         level += 1
-        groups = [notes[i : i + group_size] for i in range(0, len(notes), group_size)]
         if on_progress:
             await on_progress(
                 f"正在分层归并（第 {level} 层，{len(notes)} 段 → {len(groups)} 组）..."

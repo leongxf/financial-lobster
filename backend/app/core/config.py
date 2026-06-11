@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     llm_max_pages: int = 200
     # 分层归并时每组合并的分片笔记数；笔记超过该数则先分组归并再终合，避免一次性 reduce 爆上下文。
     llm_reduce_group_size: int = 8
+    # 单次归并/合成调用喂给模型的笔记字符预算上限：分组时除条数外再按此预算封顶，
+    # 防止 group_size 段笔记拼起来超出模型输入长度上限（如 dashscope 30720）。
+    llm_reduce_max_chars: int = 24_000
     # map 阶段并发调用数（qwen 接口有速率限制，默认保守）。
     llm_map_concurrency: int = 4
     # 防跑飞硬上限：页数才是真正的限制，这里给一个高位兜底。
