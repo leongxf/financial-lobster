@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     qa_prompt_version: str = "material_qa:v1"
 
     # 向量检索（embedding）相关配置。中英混排材料靠多语言 embedding 做语义检索。
+    # embedding 可独立于 chat 走另一平台：以下两项留空则复用 llm_base_url/llm_api_key（同账号），
+    # 填写则 embedding 请求改用该平台（仍需 OpenAI 兼容 /embeddings）。chat 不受影响。
+    # 用途：chat 平台额度耗尽或想把向量算力分流到免费/独立账号时，只改这两项 + 模型名即可。
+    qa_embedding_base_url: str = ""
+    qa_embedding_api_key: str = ""
     qa_embedding_model: str = "text-embedding-v3"  # dashscope 多语言向量模型。
     # 备用 embedding 模型（逗号分隔，同账号）：入库时主模型额度耗尽则整文件改用下一个重算，
     # 并把实际所用模型记入缓存；查询时强制用该文件入库时的模型，避免跨模型向量空间错配。
@@ -93,6 +98,16 @@ class Settings(BaseSettings):
     @property
     def fallback_models(self) -> list[str]:
         return [m.strip() for m in self.llm_fallback_models.split(",") if m.strip()]
+
+    @property
+    def embedding_base_url(self) -> str:
+        """embedding 请求的 base_url：未单独配置则复用 chat 的 llm_base_url。"""
+        return self.qa_embedding_base_url.strip() or self.llm_base_url
+
+    @property
+    def embedding_api_key(self) -> str:
+        """embedding 请求的 api_key：未单独配置则复用 chat 的 llm_api_key。"""
+        return self.qa_embedding_api_key.strip() or self.llm_api_key
 
     @property
     def embedding_model_chain(self) -> list[str]:

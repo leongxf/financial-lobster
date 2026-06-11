@@ -47,6 +47,25 @@ logger = logging.getLogger(__name__)
 REPORT_TEXT_MAX_CHARS = 3500
 
 
+def build_embedding_provider(settings: Settings) -> LLMProvider:
+    """构造 embedding 专用 provider：base_url/api_key 取 embedding 配置（未配置则回退 chat）。
+
+    embedding 可独立于 chat 走另一平台，故不能复用 chat provider。模型名由各调用方
+    按 embedding_model_chain / 缓存记录的模型显式传入，这里的 model 仅作占位默认值。
+    """
+    return LLMProvider(
+        LLMConfig(
+            provider=settings.llm_provider,
+            base_url=settings.embedding_base_url,
+            api_key=settings.embedding_api_key,
+            model=settings.qa_embedding_model,
+            timeout_ms=settings.llm_timeout_ms,
+            max_tokens=settings.llm_max_tokens,
+            temperature=settings.llm_temperature,
+        )
+    )
+
+
 def format_model_info(settings: Settings) -> str:
     if settings.llm_api_key:
         return f"{settings.llm_model}（provider: {settings.llm_provider}）"
@@ -481,7 +500,7 @@ async def process_file_message_async(
             # 预计算向量（embedding）供追问做语义检索；中英混排材料靠它解决跨语言检索。
             # 按 file_hash 缓存：同内容文件重传直接复用，不重算。算完后补写 embeddings_path
             # 升级为向量检索；失败不阻断主流程（仍可关键词检索）。
-            if settings.llm_api_key:
+            if settings.embedding_api_key:
                 cache_dir = settings.qa_embedding_cache_dir
                 try:
                     pages_data = [
@@ -490,17 +509,7 @@ async def process_file_message_async(
                     ]
                     cached = load_cached_embeddings(cache_dir, file_hash)
                     if cached is None:
-                        embed_provider = LLMProvider(
-                            LLMConfig(
-                                provider=settings.llm_provider,
-                                base_url=settings.llm_base_url,
-                                api_key=settings.llm_api_key,
-                                model=settings.llm_model,
-                                timeout_ms=settings.llm_timeout_ms,
-                                max_tokens=settings.llm_max_tokens,
-                                temperature=settings.llm_temperature,
-                            )
-                        )
+                        embed_provider = build_embedding_provider(settings)
                         chunks, embedding_model_used = await build_chunk_embeddings(
                             pages_data,
                             provider=embed_provider,
@@ -755,10 +764,11 @@ async def process_question_async(
                 or settings.qa_embedding_model
             )
             try:
+                # embedding 走独立 provider（可能是另一平台），不能复用 chat provider。
                 context = await retrieve_by_embedding(
                     question=question,
                     chunks=cached_chunks,
-                    provider=provider,
+                    provider=build_embedding_provider(settings),
                     model=cached_embedding_model,
                     top_k=settings.qa_retrieve_top_k,
                     max_chars=settings.qa_context_max_chars,
