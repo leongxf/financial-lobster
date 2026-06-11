@@ -83,6 +83,11 @@ def _classify_llm_error(status_code: int, body: str) -> tuple[str, str]:
         "insufficient_user_quota",
         "account is in good standing",
         "billing",
+        # 免费额度耗尽（如阿里百炼 AllocationQuota.FreeTierOnly，返回 403 易被误判为鉴权）。
+        # 必须在 auth 分支之前命中，归到 billing 才能触发备用模型 fallback。
+        "freetieronly",
+        "allocationquota",
+        "free tier",
     ):
         return (
             "billing",
