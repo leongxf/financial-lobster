@@ -117,6 +117,90 @@ class FeishuClient:
 
         await _with_retry(_send)
 
+    async def reply_card(self, message_id: str, card: dict) -> None:
+        """回复一张交互卡片到原消息会话。"""
+        token = await self.get_tenant_access_token()
+
+        async def _send() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
+                resp = await client.post(
+                    f"{self.base_url}/im/v1/messages/{message_id}/reply",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={
+                        "msg_type": "interactive",
+                        "content": json.dumps(card, ensure_ascii=False),
+                    },
+                )
+                resp.raise_for_status()
+                return resp
+
+        await _with_retry(_send)
+
+    async def send_card(
+        self,
+        receive_id: str,
+        card: dict,
+        receive_id_type: str = "open_id",
+    ) -> None:
+        """主动给用户/群发送交互卡片。"""
+        token = await self.get_tenant_access_token()
+
+        async def _send() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
+                resp = await client.post(
+                    f"{self.base_url}/im/v1/messages",
+                    params={"receive_id_type": receive_id_type},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json; charset=utf-8",
+                    },
+                    json={
+                        "receive_id": receive_id,
+                        "msg_type": "interactive",
+                        "content": json.dumps(card, ensure_ascii=False),
+                    },
+                )
+                resp.raise_for_status()
+                return resp
+
+        await _with_retry(_send)
+
+    async def send_file(
+        self,
+        receive_id: str,
+        file_path: Path,
+        file_name: str | None = None,
+        receive_id_type: str = "open_id",
+        file_type: str = "stream",
+    ) -> None:
+        """主动给指定用户/群发送文件消息。"""
+        file_key = await self.upload_file(
+            file_path=file_path,
+            file_name=file_name or file_path.name,
+            file_type=file_type,
+        )
+        token = await self.get_tenant_access_token()
+
+        async def _send() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
+                resp = await client.post(
+                    f"{self.base_url}/im/v1/messages",
+                    params={"receive_id_type": receive_id_type},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json; charset=utf-8",
+                    },
+                    json={
+                        "receive_id": receive_id,
+                        "msg_type": "file",
+                        "content": json.dumps({"file_key": file_key}, ensure_ascii=False),
+                    },
+                )
+                resp.raise_for_status()
+                return resp
+
+        await _with_retry(_send)
+
     async def reply_text(self, message_id: str, text: str, max_chars: int = 3500) -> None:
         if len(text) <= max_chars:
             await self._reply_text_once(message_id, text)

@@ -10,12 +10,17 @@ from pathlib import Path
 import httpx
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    P2CardActionTrigger,
+    P2CardActionTriggerResponse,
+)
 
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.integrations.feishu.client import FeishuClient
 from app.integrations.feishu.events import extract_file_message, extract_message_brief
 from app.services.analysis_cache import AnalysisCache, sha256_file
+from app.services.cards import build_done_card
 from app.services.conversation_store import ConversationStore
 from app.services.document_parser import parse_document
 from app.services.event_dedup import EventDeduplicator
@@ -41,7 +46,13 @@ from app.services.qa_service import (
     save_cached_embeddings,
     score_file_by_keywords,
 )
+from app.services.session_store import SessionStore
 from app.services.task_store import TaskStore
+from app.skills.base import IncomingMessage, SkillContext, SkillRouter
+from app.skills.compliance import COMPLIANCE_PROMPT
+from app.skills.registry import build_registry
+from app.tools.base import ToolRegistry
+from app.tools.web_search import WebSearchTool
 
 logger = logging.getLogger(__name__)
 REPORT_TEXT_MAX_CHARS = 3500
@@ -846,38 +857,6 @@ def start_question_processing(
     thread.start()
 
 
-def extract_text_question(payload: dict) -> tuple[str, str, str] | None:
-    """从文本消息事件中提取 (message_id, sender_open_id, 问题文本)。非文本消息返回 None。"""
-    event = payload.get("event")
-    if not isinstance(event, dict):
-        return None
-    message = event.get("message")
-    if not isinstance(message, dict) or message.get("message_type") != "text":
-        return None
-    message_id = message.get("message_id")
-    if not message_id:
-        return None
-
-    content = message.get("content")
-    if isinstance(content, str):
-        try:
-            content = json.loads(content)
-        except json.JSONDecodeError:
-            content = {}
-    text = str((content or {}).get("text") or "").strip()
-    if not text:
-        return None
-
-    sender = event.get("sender")
-    sender_id = None
-    if isinstance(sender, dict) and isinstance(sender.get("sender_id"), dict):
-        sender_id = sender["sender_id"].get("open_id")
-    if not sender_id:
-        return None
-
-    return message_id, sender_id, text
-
-
 def extract_message_id(payload: dict) -> str | None:
     """从事件 payload 中提取 message_id，用于事件级去重。"""
     event = payload.get("event")
@@ -890,65 +869,212 @@ def extract_message_id(payload: dict) -> str | None:
     return message_id if isinstance(message_id, str) and message_id else None
 
 
+def _strip_mentions(text: str, message: dict) -> str:
+    mentions = message.get("mentions")
+    if not isinstance(mentions, list):
+        return text.strip()
+    for mention in mentions:
+        if not isinstance(mention, dict):
+            continue
+        key = mention.get("key")
+        if isinstance(key, str) and key:
+            text = text.replace(key, "")
+    return text.strip()
+
+
+def normalize_incoming(payload: dict) -> IncomingMessage | None:
+    """将飞书消息事件归一化为 IncomingMessage。"""
+    event = payload.get("event")
+    if not isinstance(event, dict):
+        return None
+
+    file_message = extract_file_message(payload)
+    if file_message is not None:
+        if not file_message.message_id or not file_message.file_key:
+            return None
+        return IncomingMessage(
+            message_id=file_message.message_id,
+            sender_id=file_message.sender_id,
+            chat_id=file_message.chat_id,
+            msg_type="file",
+            file_key=file_message.file_key,
+            file_name=file_message.file_name,
+            file_size=file_message.file_size,
+            raw_payload=payload,
+        )
+
+    message = event.get("message")
+    if not isinstance(message, dict) or message.get("message_type") != "text":
+        return None
+
+    message_id = message.get("message_id")
+    if not message_id:
+        return None
+
+    content = message.get("content")
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except json.JSONDecodeError:
+            content = {}
+    text = _strip_mentions(str((content or {}).get("text") or ""), message)
+    if not text:
+        return None
+
+    sender = event.get("sender")
+    sender_id = None
+    if isinstance(sender, dict) and isinstance(sender.get("sender_id"), dict):
+        sender_id = sender["sender_id"].get("open_id")
+    if not sender_id:
+        return None
+
+    return IncomingMessage(
+        message_id=message_id,
+        sender_id=sender_id,
+        chat_id=message.get("chat_id"),
+        msg_type="text",
+        text=text,
+        raw_payload=payload,
+    )
+
+
+def build_tool_registry(settings: Settings) -> ToolRegistry:
+    tools = ToolRegistry()
+    if settings.search_key:
+        tools.register(
+            WebSearchTool(
+                base_url=settings.search_endpoint,
+                api_key=settings.search_key,
+                engine=settings.search_engine,
+            )
+        )
+    return tools
+
+
+def create_skill_router(settings: Settings) -> tuple[SkillRouter, object]:
+    registry = build_registry(settings)
+
+    def ctx_factory() -> SkillContext:
+        return SkillContext(
+            settings=settings,
+            client=FeishuClient(settings.feishu_app_id, settings.feishu_app_secret),
+            tools=build_tool_registry(settings),
+            compliance_prompt=COMPLIANCE_PROMPT,
+            conversation_store=ConversationStore(
+                settings.conversation_storage_dir,
+                recent_files_max=settings.qa_recent_files_max,
+            ),
+            task_store=TaskStore(settings.task_storage_dir),
+            session_store=SessionStore(settings.session_storage_dir),
+            analysis_cache=AnalysisCache(settings.analysis_cache_dir),
+            registry=registry,
+        )
+
+    return SkillRouter(registry, ctx_factory), registry
+
+
+async def route_message_async(settings: Settings, msg: IncomingMessage) -> None:
+    router, _ = create_skill_router(settings)
+    await router.route_message_async(msg)
+
+
+async def route_card_async(settings: Settings, ca) -> None:
+    router, _ = create_skill_router(settings)
+    await router.route_card_async(ca)
+
+
+def start_message_processing(settings: Settings, msg: IncomingMessage) -> None:
+    thread = threading.Thread(
+        target=lambda: asyncio.run(route_message_async(settings, msg)),
+        daemon=True,
+    )
+    thread.start()
+
+
+def start_card_action_processing(settings: Settings, ca) -> None:
+    thread = threading.Thread(
+        target=lambda: asyncio.run(route_card_async(settings, ca)),
+        daemon=True,
+    )
+    thread.start()
+
+
+def handle_card_action(data: P2CardActionTrigger, settings: Settings) -> P2CardActionTriggerResponse:
+    from app.integrations.feishu.events import extract_card_action
+
+    ca = extract_card_action(data)
+    if ca is None:
+        return P2CardActionTriggerResponse({"toast": {"type": "error", "content": "无效操作"}})
+
+    card_dedup = EventDeduplicator(settings.card_event_dedup_dir)
+    if ca.token and not card_dedup.mark_if_new(ca.token):
+        return P2CardActionTriggerResponse({"toast": {"type": "info", "content": "处理中…"}})
+
+    logger.info(
+        "received feishu card action",
+        extra={
+            "action": ca.action,
+            "skill_id": ca.skill_id,
+            "operator_id": ca.operator_id,
+            "token": ca.token,
+        },
+    )
+
+    if ca.action == "cancel":
+        if ca.operator_id:
+            SessionStore(settings.session_storage_dir).clear(ca.operator_id)
+        return P2CardActionTriggerResponse(
+            {
+                "toast": {"type": "info", "content": "已取消"},
+                "card": {"type": "raw", "data": build_done_card("已取消。")},
+            }
+        )
+
+    start_card_action_processing(settings, ca)
+    return P2CardActionTriggerResponse(
+        {
+            "toast": {"type": "info", "content": "已开始处理"},
+            "card": {"type": "raw", "data": build_done_card("已收到，正在处理…")},
+        }
+    )
+
+
 def handle_message_receive(data: P2ImMessageReceiveV1, settings: Settings) -> None:
     raw = lark.JSON.marshal(data)
     payload = json.loads(raw)
 
-    # 事件幂等：飞书重推同一事件（message_id 不变）时直接丢弃，避免重复分析/回复/消耗 token。
-    # 放在最前面，连管理员提醒也不重复推。
     message_id = extract_message_id(payload)
     deduplicator = EventDeduplicator(settings.event_dedup_dir)
     if message_id and not deduplicator.mark_if_new(message_id):
         logger.info("ignored duplicate feishu event", extra={"message_id": message_id})
         return
 
-    # 额外推送旁路：先给管理员推一条提醒，再走原有文件处理逻辑（原逻辑保持不变）。
     notify_admin_on_message(payload, settings)
 
-    file_message = extract_file_message(payload)
-    if file_message is None:
-        # 非文件消息：尝试作为文本追问处理。
-        question = extract_text_question(payload)
-        if question is not None:
-            q_message_id, q_sender_id, q_text = question
-            logger.info(
-                "received feishu text question",
-                extra={"message_id": q_message_id, "sender_id": q_sender_id},
-            )
-            start_question_processing(
-                settings=settings,
-                message_id=q_message_id,
-                sender_id=q_sender_id,
-                question=q_text,
-            )
-            return
-
+    msg = normalize_incoming(payload)
+    if msg is None:
         message_type = (
             payload.get("event", {}).get("message", {}).get("message_type")
         )
         logger.info("ignored non-file feishu message", extra={"message_type": message_type})
         return
 
-    if not file_message.message_id or not file_message.file_key:
-        logger.warning("file message missing message_id or file_key", extra={"payload": payload})
-        return
+    if msg.msg_type == "file":
+        logger.info(
+            "received feishu file message",
+            extra={
+                "message_id": msg.message_id,
+                "file_name": msg.file_name,
+                "file_key": msg.file_key,
+            },
+        )
+    else:
+        logger.info(
+            "received feishu text message",
+            extra={"message_id": msg.message_id, "sender_id": msg.sender_id},
+        )
 
-    logger.info(
-        "received feishu file message",
-        extra={
-            "message_id": file_message.message_id,
-            "file_name": file_message.file_name,
-            "file_key": file_message.file_key,
-        },
-    )
-    start_file_processing(
-        settings=settings,
-        message_id=file_message.message_id,
-        file_key=file_message.file_key,
-        file_name=file_message.file_name,
-        sender_id=file_message.sender_id,
-        file_size=file_message.file_size,
-    )
+    start_message_processing(settings, msg)
 
 
 def main() -> None:
@@ -961,9 +1087,13 @@ def main() -> None:
     def on_message_receive(data: P2ImMessageReceiveV1) -> None:
         handle_message_receive(data, settings)
 
+    def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+        return handle_card_action(data, settings)
+
     event_handler = (
         lark.EventDispatcherHandler.builder("", "")
         .register_p2_im_message_receive_v1(on_message_receive)
+        .register_p2_card_action_trigger(on_card_action)
         .build()
     )
 

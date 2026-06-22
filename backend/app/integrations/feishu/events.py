@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel
@@ -158,4 +159,44 @@ def extract_message_brief(payload: dict[str, Any]) -> FeishuMessageBrief | None:
         sender_id=sender_id,
         message_type=message_type,
         summary=_summarize_content(message_type, content),
+    )
+
+
+@dataclass
+class CardAction:
+    operator_id: str | None
+    token: str
+    open_message_id: str | None
+    chat_id: str | None
+    action: str
+    skill_id: str | None
+    args: dict = field(default_factory=dict)
+    form_value: dict = field(default_factory=dict)
+
+
+def extract_card_action(data) -> CardAction | None:
+    """从 P2CardActionTrigger 提取归一化的 CardAction。结构缺失时返回 None。"""
+    event = getattr(data, "event", None)
+    if event is None:
+        return None
+    action_obj = getattr(event, "action", None)
+    value = (getattr(action_obj, "value", None) or {}) if action_obj else {}
+    if not isinstance(value, dict):
+        value = {}
+    operator = getattr(event, "operator", None)
+    context = getattr(event, "context", None)
+    action_name = str(value.get("action") or "")
+    if not action_name:
+        return None
+    args = {k: v for k, v in value.items() if k not in ("action", "skill_id")}
+    skill_id = value.get("skill_id")
+    return CardAction(
+        operator_id=getattr(operator, "open_id", None) if operator else None,
+        token=str(getattr(event, "token", "") or ""),
+        open_message_id=getattr(context, "open_message_id", None) if context else None,
+        chat_id=getattr(context, "open_chat_id", None) if context else None,
+        action=action_name,
+        skill_id=str(skill_id) if skill_id else None,
+        args=args,
+        form_value=(getattr(action_obj, "form_value", None) or {}) if action_obj else {},
     )

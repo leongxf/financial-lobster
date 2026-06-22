@@ -77,6 +77,25 @@ class Settings(BaseSettings):
     qa_embedding_batch_size: int = 10  # 单次 embedding 请求的最大文本条数（接口上限）。
     qa_embedding_cache_dir: str = "storage/embeddings"  # 向量缓存目录，按 file_hash 命名。
 
+    # 联网检索（web search）独立配置：此前原型偷用 qa_embedding_api_key，现拆开。
+    search_provider: str = "zhipu"
+    search_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+    search_api_key: str = ""
+    search_engine: str = "search_std"
+    search_max_sources: int = 8
+    search_queries_per_section: int = 3
+
+    # 行业研究默认模板 docx 路径（必填方可执行行业研究）
+    research_template_path: str = ""
+
+    # 会话状态 / 卡片回调去重
+    session_storage_dir: str = "storage/sessions"
+    card_event_dedup_dir: str = "storage/card_events"
+
+    # 技能开关（关闭则不出现在能力卡 / 拒绝触发）
+    enable_industry_research: bool = True
+    enable_template_rewrite: bool = True
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -118,6 +137,19 @@ class Settings(BaseSettings):
             if model and model not in chain:
                 chain.append(model)
         return chain
+
+    @property
+    def search_key(self) -> str:
+        """web search 的 key：未单独配置则回退到此前偷用的 qa_embedding_api_key。"""
+        return self.search_api_key.strip() or self.qa_embedding_api_key.strip()
+
+    @property
+    def search_endpoint(self) -> str:
+        return (
+            self.search_base_url.strip()
+            or self.qa_embedding_base_url.strip()
+            or "https://open.bigmodel.cn/api/paas/v4"
+        )
 
 
 @lru_cache
