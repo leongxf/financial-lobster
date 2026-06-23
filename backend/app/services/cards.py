@@ -37,6 +37,48 @@ def build_capability_menu(buttons: list[dict]) -> dict:
                     for b in buttons
                 ],
             },
+            {
+                "tag": "action",
+                "actions": [
+                    _button("清理记忆", {"action": "clear_memory"}, "default"),
+                ],
+            },
+        ],
+    }
+
+
+def build_clear_memory_confirm_card() -> dict:
+    """用户主动清理会话记忆的确认卡。"""
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "orange",
+            "title": {"tag": "plain_text", "content": "确认清理会话记忆？"},
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        "将清除：\n"
+                        "- 最近文件索引与多轮追问历史\n"
+                        "- 进行中的技能会话（如行业研究输入流程）\n\n"
+                        "不会删除已上传的原始文件、解析结果与分析缓存。"
+                    ),
+                },
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    _button(
+                        "确认清理",
+                        {"action": "confirm_clear_memory"},
+                        "primary",
+                    ),
+                    _button("取消", {"action": "cancel"}, "default"),
+                ],
+            },
         ],
     }
 
@@ -104,6 +146,71 @@ def build_template_select_card(
                 "text": {"tag": "lark_md", "content": "点选一个模板，我会按它的提纲展开研究。"},
             },
             {"tag": "action", "actions": actions},
+        ],
+    }
+
+
+def build_research_target_input_card(
+    skill_id: str,
+    template_name: str,
+    template_label: str,
+    carry: dict[str, Any] | None = None,
+) -> dict:
+    """目标输入卡：卡片内放一个输入框让用户直接填公司名并提交。
+
+    模板名走提交按钮 value，公司名走 form_value["company"]（提交时由飞书回传）。
+    carry 透传已有上下文（如 file_id）；提交后 action="run_skill" 携带 template + company。
+    """
+    carry = carry or {}
+    submit_value = {
+        "action": "run_skill",
+        "skill_id": skill_id,
+        "template": template_name,
+        **carry,
+    }
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": "请输入要研究的公司"},
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"已选模板「{template_label}」，请在下方输入要研究的公司名。",
+                },
+            },
+            {
+                "tag": "form",
+                "name": "research_target_form",
+                "elements": [
+                    {
+                        "tag": "input",
+                        "name": "company",
+                        "required": True,
+                        "placeholder": {
+                            "tag": "plain_text",
+                            "content": "请输入公司名，例如：阿里巴巴",
+                        },
+                    },
+                    {
+                        "tag": "action",
+                        "actions": [
+                            {
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": "开始研究"},
+                                "type": "primary",
+                                "action_type": "form_submit",
+                                "name": "submit",
+                                "value": submit_value,
+                            }
+                        ],
+                    },
+                ],
+            },
+            {"tag": "action", "actions": [_button("取消", {"action": "cancel"}, "default")]},
         ],
     }
 

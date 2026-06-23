@@ -22,7 +22,7 @@ from app.core.logging import configure_logging
 from app.integrations.feishu.client import FeishuClient
 from app.integrations.feishu.events import extract_file_message, extract_message_brief
 from app.services.analysis_cache import AnalysisCache, sha256_file
-from app.services.cards import build_done_card
+from app.services.cards import build_clear_memory_confirm_card, build_done_card
 from app.services.conversation_store import ConversationStore
 from app.services.document_parser import parse_document
 from app.services.event_dedup import EventDeduplicator
@@ -50,6 +50,7 @@ from app.services.qa_service import (
 )
 from app.services.session_store import SessionStore
 from app.services.task_store import TaskStore
+from app.services.user_memory import clear_memory_result_message, clear_user_memory
 from app.skills.base import IncomingMessage, SkillContext, SkillRouter
 from app.skills.compliance import COMPLIANCE_PROMPT
 from app.skills.registry import build_registry
@@ -1071,6 +1072,19 @@ def start_menu_processing(settings: Settings, open_id: str, event_key: str) -> N
     thread.start()
 
 
+async def send_clear_memory_confirm_async(settings: Settings, open_id: str) -> None:
+    client = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
+    await client.send_card(open_id, build_clear_memory_confirm_card())
+
+
+def start_clear_memory_prompt(settings: Settings, open_id: str) -> None:
+    thread = threading.Thread(
+        target=lambda: asyncio.run(send_clear_memory_confirm_async(settings, open_id)),
+        daemon=True,
+    )
+    thread.start()
+
+
 def handle_card_action(data: P2CardActionTrigger, settings: Settings) -> P2CardActionTriggerResponse:
     from app.integrations.feishu.events import extract_card_action
 
@@ -1099,6 +1113,34 @@ def handle_card_action(data: P2CardActionTrigger, settings: Settings) -> P2CardA
             {
                 "toast": {"type": "info", "content": "已取消"},
                 "card": {"type": "raw", "data": build_done_card("已取消。")},
+            }
+        )
+
+    if ca.action == "clear_memory":
+        return P2CardActionTriggerResponse(
+            {
+                "toast": {"type": "info", "content": "请确认是否清理"},
+                "card": {"type": "raw", "data": build_clear_memory_confirm_card()},
+            }
+        )
+
+    if ca.action == "confirm_clear_memory":
+        message = "暂无需要清理的会话记忆。"
+        if ca.operator_id:
+            result = clear_user_memory(settings, ca.operator_id)
+            message = clear_memory_result_message(result)
+            logger.info(
+                "user cleared memory via card",
+                extra={
+                    "open_id": ca.operator_id,
+                    "had_conversation": result.had_conversation,
+                    "had_session": result.had_session,
+                },
+            )
+        return P2CardActionTriggerResponse(
+            {
+                "toast": {"type": "success", "content": "已清理"},
+                "card": {"type": "raw", "data": build_done_card(message)},
             }
         )
 
@@ -1131,6 +1173,9 @@ def handle_bot_menu(data: P2ApplicationBotMenuV6, settings: Settings) -> None:
         "received feishu bot menu event",
         extra={"operator_id": menu.operator_id, "event_key": menu.event_key},
     )
+    if menu.event_key == settings.clear_memory_menu_event_key:
+        start_clear_memory_prompt(settings, menu.operator_id)
+        return
     start_menu_processing(settings, menu.operator_id, menu.event_key)
 
 

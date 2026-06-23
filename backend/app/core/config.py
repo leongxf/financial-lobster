@@ -64,6 +64,8 @@ class Settings(BaseSettings):
     user_memory_ttl_days: int = 5
     user_memory_cleanup_enabled: bool = True
     user_memory_cleanup_interval_hours: int = 6  # worker 后台 sweep 间隔（小时）。
+    # 飞书机器人自定义菜单 event_key：点击后发确认卡，用户确认后清理该用户会话记忆。
+    clear_memory_menu_event_key: str = "clear_memory"
 
     # 向量检索（embedding）相关配置。中英混排材料靠多语言 embedding 做语义检索。
     # embedding 可独立于 chat 走另一平台：以下两项留空则复用 llm_base_url/llm_api_key（同账号），

@@ -90,6 +90,14 @@ class ConversationStore:
             encoding="utf-8",
         )
 
+    def clear_user(self, open_id: str) -> bool:
+        """删除指定用户的全部会话数据；不存在时返回 False。"""
+        path = self._path(open_id)
+        if not path.exists():
+            return False
+        path.unlink(missing_ok=True)
+        return True
+
     # ---- 业务方法 ----
     def upsert_file(
         self,

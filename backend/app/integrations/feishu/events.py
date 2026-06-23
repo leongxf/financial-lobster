@@ -215,6 +215,10 @@ def extract_card_action(data) -> CardAction | None:
     if not action_name:
         return None
     args = {k: v for k, v in value.items() if k not in ("action", "skill_id")}
+    form_value = (getattr(action_obj, "form_value", None) or {}) if action_obj else {}
+    if isinstance(form_value, dict):
+        # 表单提交时输入值经 form_value 回传（如 {"company": "用户输入"}），并入 args。
+        args.update(form_value)
     skill_id = value.get("skill_id")
     return CardAction(
         operator_id=getattr(operator, "open_id", None) if operator else None,
@@ -224,5 +228,5 @@ def extract_card_action(data) -> CardAction | None:
         action=action_name,
         skill_id=str(skill_id) if skill_id else None,
         args=args,
-        form_value=(getattr(action_obj, "form_value", None) or {}) if action_obj else {},
+        form_value=form_value if isinstance(form_value, dict) else {},
     )

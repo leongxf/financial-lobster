@@ -3,7 +3,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from app.services.cards import build_confirm_card, build_template_select_card
+from app.services.cards import (
+    build_confirm_card,
+    build_research_target_input_card,
+    build_template_select_card,
+)
 from app.services.industry_research import (
     build_profile,
     format_verification_summary,
@@ -102,7 +106,8 @@ class IndustryResearchSkill:
             )
             return
 
-        # 第二步：已选模板但还没研究目标 → 引导输入公司名或发文件（args 已含 template）。
+        # 第二步：已选模板但还没研究目标 → 下发带输入框的卡，让用户在卡片内填公司名。
+        # 仍 set_active 作为兜底：用户若直接在聊天框打字，resume() 也能接住。
         if not args.get("file_id") and not args.get("company"):
             ctx.session_store.set_active(
                 operator_id,
@@ -110,9 +115,14 @@ class IndustryResearchSkill:
                 awaiting="research_target",
                 args=args,
             )
-            await ctx.client.send_text(
+            await ctx.client.send_card(
                 operator_id,
-                f"已选择模板「{template_path.stem}」。\n请输入要研究的公司名，或直接发给我一个文件。",
+                build_research_target_input_card(
+                    self.skill_id,
+                    args.get("template"),
+                    template_path.stem,
+                    carry={k: v for k, v in args.items() if k != "template"},
+                ),
             )
             return
 
