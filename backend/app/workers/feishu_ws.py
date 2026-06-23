@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -252,14 +253,12 @@ async def process_file_message_async(
     sender_id: str | None = None,
     file_size: int | None = None,
 ) -> None:
+    maybe_purge_user_memory(settings, sender_id)
     task_id = message_id
     client = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
     task_store = TaskStore(settings.task_storage_dir)
     analysis_cache = AnalysisCache(settings.analysis_cache_dir)
-    conversation_store = ConversationStore(
-        settings.conversation_storage_dir,
-        recent_files_max=settings.qa_recent_files_max,
-    )
+    conversation_store = build_conversation_store(settings)
     safe_name = file_name or "uploaded-file"
     storage_dir = Path(settings.local_storage_dir) / message_id
     target_path = storage_dir / safe_name
@@ -710,11 +709,9 @@ async def process_question_async(
     question: str,
 ) -> None:
     """处理用户对已上传文件的文字追问。"""
+    maybe_purge_user_memory(settings, sender_id)
     client = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
-    conversation_store = ConversationStore(
-        settings.conversation_storage_dir,
-        recent_files_max=settings.qa_recent_files_max,
-    )
+    conversation_store = build_conversation_store(settings)
 
     async def notify(text: str) -> None:
         await client.reply_text(message_id, text)
@@ -939,6 +936,67 @@ def normalize_incoming(payload: dict) -> IncomingMessage | None:
     )
 
 
+def build_conversation_store(settings: Settings) -> ConversationStore:
+    return ConversationStore(
+        settings.conversation_storage_dir,
+        recent_files_max=settings.qa_recent_files_max,
+    )
+
+
+def run_memory_purge(settings: Settings, *, reason: str) -> None:
+    if not settings.user_memory_cleanup_enabled:
+        return
+    stats = build_conversation_store(settings).purge_all_expired(
+        ttl_days=settings.user_memory_ttl_days,
+    )
+    logger.info(
+        "user memory purge (%s)",
+        reason,
+        extra={
+            "users_scanned": stats.users_scanned,
+            "users_deleted": stats.users_deleted,
+            "files_removed": stats.files_removed,
+        },
+    )
+
+
+def maybe_purge_user_memory(settings: Settings, open_id: str | None) -> None:
+    if not open_id or not settings.user_memory_cleanup_enabled:
+        return
+    stats = build_conversation_store(settings).purge_expired(
+        open_id,
+        ttl_days=settings.user_memory_ttl_days,
+    )
+    if stats.files_removed or stats.users_deleted:
+        logger.info(
+            "lazy user memory purge",
+            extra={
+                "open_id": open_id,
+                "users_deleted": stats.users_deleted,
+                "files_removed": stats.files_removed,
+            },
+        )
+
+
+def _memory_retention_loop(settings: Settings) -> None:
+    interval_seconds = max(1, settings.user_memory_cleanup_interval_hours) * 3600
+    while True:
+        time.sleep(interval_seconds)
+        run_memory_purge(settings, reason="periodic")
+
+
+def start_memory_retention_thread(settings: Settings) -> None:
+    if not settings.user_memory_cleanup_enabled:
+        return
+    thread = threading.Thread(
+        target=_memory_retention_loop,
+        args=(settings,),
+        daemon=True,
+        name="memory-retention",
+    )
+    thread.start()
+
+
 def build_tool_registry(settings: Settings) -> ToolRegistry:
     tools = ToolRegistry()
     if settings.search_key:
@@ -961,10 +1019,7 @@ def create_skill_router(settings: Settings) -> tuple[SkillRouter, object]:
             client=FeishuClient(settings.feishu_app_id, settings.feishu_app_secret),
             tools=build_tool_registry(settings),
             compliance_prompt=COMPLIANCE_PROMPT,
-            conversation_store=ConversationStore(
-                settings.conversation_storage_dir,
-                recent_files_max=settings.qa_recent_files_max,
-            ),
+            conversation_store=build_conversation_store(settings),
             task_store=TaskStore(settings.task_storage_dir),
             session_store=SessionStore(settings.session_storage_dir),
             analysis_cache=AnalysisCache(settings.analysis_cache_dir),
@@ -975,16 +1030,19 @@ def create_skill_router(settings: Settings) -> tuple[SkillRouter, object]:
 
 
 async def route_message_async(settings: Settings, msg: IncomingMessage) -> None:
+    maybe_purge_user_memory(settings, msg.sender_id)
     router, _ = create_skill_router(settings)
     await router.route_message_async(msg)
 
 
 async def route_card_async(settings: Settings, ca) -> None:
+    maybe_purge_user_memory(settings, ca.operator_id)
     router, _ = create_skill_router(settings)
     await router.route_card_async(ca)
 
 
 async def route_menu_async(settings: Settings, open_id: str, event_key: str) -> None:
+    maybe_purge_user_memory(settings, open_id)
     router, _ = create_skill_router(settings)
     await router.route_menu_async(open_id, event_key)
 
@@ -1120,6 +1178,9 @@ def main() -> None:
 
     if not settings.feishu_app_id or not settings.feishu_app_secret:
         raise RuntimeError("未配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET")
+
+    run_memory_purge(settings, reason="startup")
+    start_memory_retention_thread(settings)
 
     def on_message_receive(data: P2ImMessageReceiveV1) -> None:
         handle_message_receive(data, settings)

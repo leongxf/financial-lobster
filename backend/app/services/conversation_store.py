@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,33 @@ def _now_iso() -> str:
 
 def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
+
+
+@dataclass(frozen=True)
+class PurgeStats:
+    users_scanned: int = 0
+    users_deleted: int = 0
+    files_removed: int = 0
+
+    def __add__(self, other: PurgeStats) -> PurgeStats:
+        return PurgeStats(
+            users_scanned=self.users_scanned + other.users_scanned,
+            users_deleted=self.users_deleted + other.users_deleted,
+            files_removed=self.files_removed + other.files_removed,
+        )
+
+
+def _parse_iso(value: str) -> datetime | None:
+    if not value:
+        return None
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 class ConversationStore:
@@ -181,6 +209,76 @@ class ConversationStore:
         history = file_entry.get("history", [])
         keep = max_turns * 2
         return history[-keep:] if keep > 0 else history
+
+    def purge_expired(self, open_id: str, *, ttl_days: int) -> PurgeStats:
+        """清理指定用户超过 TTL 的文件画像；若全部过期则删除用户 JSON。"""
+        if ttl_days <= 0:
+            return PurgeStats()
+        path = self._path(open_id)
+        if not path.exists():
+            return PurgeStats()
+        return self._purge_path(path, ttl_days=ttl_days)
+
+    def purge_all_expired(self, *, ttl_days: int) -> PurgeStats:
+        """扫描全部用户 JSON，清理超过 TTL 的文件画像。"""
+        if ttl_days <= 0:
+            return PurgeStats()
+        total = PurgeStats()
+        for path in sorted(self.base_dir.glob("*.json")):
+            total += self._purge_path(path, ttl_days=ttl_days)
+        return total
+
+    # ---- 内部工具 ----
+    def _purge_path(self, path: Path, *, ttl_days: int) -> PurgeStats:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return PurgeStats(users_scanned=1)
+
+        files_removed = self._remove_expired_files(data, ttl_days=ttl_days)
+        stats = PurgeStats(users_scanned=1, files_removed=files_removed)
+        files = data.get("files", {})
+        if not isinstance(files, dict) or not files:
+            path.unlink(missing_ok=True)
+            return PurgeStats(
+                users_scanned=stats.users_scanned,
+                users_deleted=1,
+                files_removed=stats.files_removed,
+            )
+        if files_removed:
+            path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        return stats
+
+    def _remove_expired_files(self, data: dict[str, Any], *, ttl_days: int) -> int:
+        files = data.get("files", {})
+        if not isinstance(files, dict) or not files:
+            return 0
+
+        cutoff = datetime.now(UTC) - timedelta(days=ttl_days)
+        expired_keys = [
+            key
+            for key, entry in files.items()
+            if self._entry_expired(entry, cutoff=cutoff)
+        ]
+        for key in expired_keys:
+            files.pop(key, None)
+
+        if expired_keys and data.get("current_file_id") not in files:
+            data["current_file_id"] = self._most_recent_file_id(files)
+        return len(expired_keys)
+
+    @staticmethod
+    def _entry_expired(entry: Any, *, cutoff: datetime) -> bool:
+        if not isinstance(entry, dict):
+            return True
+        active_at = entry.get("last_active_at") or entry.get("created_at") or ""
+        parsed = _parse_iso(str(active_at))
+        if parsed is None:
+            return False
+        return parsed <= cutoff
 
     # ---- 内部工具 ----
     def _evict(self, files: dict[str, Any]) -> None:

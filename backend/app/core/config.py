@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     qa_context_max_chars: int = 24_000  # 单次喂给模型的检索片段字符预算上限。
     qa_history_max_turns: int = 5  # 单文件追问携带的最近对话轮数上限。
     qa_prompt_version: str = "material_qa:v1"
+    # 用户会话记忆（ConversationStore）保留天数：按 last_active_at 滑动过期，到期自动清理。
+    user_memory_ttl_days: int = 5
+    user_memory_cleanup_enabled: bool = True
+    user_memory_cleanup_interval_hours: int = 6  # worker 后台 sweep 间隔（小时）。
 
     # 向量检索（embedding）相关配置。中英混排材料靠多语言 embedding 做语义检索。
     # embedding 可独立于 chat 走另一平台：以下两项留空则复用 llm_base_url/llm_api_key（同账号），
