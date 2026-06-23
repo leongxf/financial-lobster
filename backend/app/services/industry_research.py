@@ -8,13 +8,16 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from app.services.llm_provider import LLMProvider
-from app.services.template_docx import parse_template_nodes, render_markdown_to_docx
+from app.services.research_fill_config import format_config_hint, get_fill_chapters
+from app.services.template_docx import (
+    effective_section_reqs,
+    parse_template_nodes,
+    render_markdown_to_docx,
+    resolve_web_fill_sections,
+)
 from app.skills.compliance import COMPLIANCE_PROMPT
 
 NotifyFn = Callable[[str], Awaitable[None]]
-
-GROUNDED_CHAPTER_KEYWORD = "行业分析"
-SOURCES_PER_SECTION = 5
 
 
 def build_profile(company: str, facts: list[str] | None = None) -> str:
@@ -282,6 +285,76 @@ def format_verification_summary(verdicts: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _chapter_summary(chapter_keywords: list[str]) -> str:
+    return "、".join(chapter_keywords)
+
+
+async def _render_configured_report(
+    *,
+    nodes: list[dict],
+    fill_sections: list[dict],
+    provider: LLMProvider,
+    web_search,
+    queries_per_section: int,
+    max_sources: int,
+    on_progress: NotifyFn,
+    profile: str | None = None,
+    source_text: str | None = None,
+) -> tuple[list[str], list[dict], list[dict]]:
+    """按配置的小节列表逐节检索并填充，其余节点仅保留标题。"""
+    fill_titles = {s["title"] for s in fill_sections}
+    fill_order = {s["title"]: i + 1 for i, s in enumerate(fill_sections)}
+    total_fill = len(fill_sections)
+
+    md_parts: list[str] = []
+    all_sources: list[dict] = []
+    seen_urls: set[str] = set()
+    all_verdicts: list[dict] = []
+
+    for node in nodes:
+        md_parts.append("#" * min(node["level"], 6) + " " + node["title"])
+        if node["title"] not in fill_titles:
+            continue
+
+        section = next(s for s in fill_sections if s["title"] == node["title"])
+        title = section["title"]
+        reqs = effective_section_reqs(section)
+        step = fill_order[title]
+
+        await on_progress(f"[{step}/{total_fill}] 生成检索词：{title}")
+        if source_text is not None:
+            queries = await generate_queries_with_source(
+                provider, title, reqs, source_text, queries_per_section
+            )
+        else:
+            queries = await generate_queries_from_profile(
+                provider, title, reqs, profile or "", queries_per_section
+            )
+
+        await on_progress(f"[{step}/{total_fill}] 联网检索：{title}")
+        section_sources = await _search_and_collect(
+            web_search, queries, seen_urls, all_sources, max_sources
+        )
+
+        await on_progress(f"[{step}/{total_fill}] 带源改写：{title}")
+        if section_sources:
+            if source_text is not None:
+                content = await grounded_fill(provider, title, reqs, source_text, section_sources)
+            else:
+                content = await fill_from_web(
+                    provider, title, reqs, section_sources, profile or ""
+                )
+            verdicts = await verify_citations(provider, content, section_sources)
+            all_verdicts.extend(verdicts)
+        elif source_text is not None:
+            content = await source_only_fill(provider, title, reqs, source_text)
+        else:
+            content = "（未检索到与目标公司相关的可靠来源）"
+        md_parts.append(content)
+
+    return md_parts, all_sources, all_verdicts
+
+
 async def run_research_from_profile(
     *,
     provider: LLMProvider,
@@ -293,39 +366,35 @@ async def run_research_from_profile(
     max_sources: int,
     on_progress: NotifyFn,
 ) -> tuple[str, list[dict]]:
+    template_dir = template_path.parent
     nodes = parse_template_nodes(template_path)
-    content_nodes = [n for n in nodes if n["reqs"]]
-    await on_progress(f"模板解析出 {len(nodes)} 个节点，其中 {len(content_nodes)} 个需检索填充。")
+    chapter_keywords = get_fill_chapters(template_dir, template_path.name)
+    if not chapter_keywords:
+        raise ValueError(format_config_hint(template_dir, template_path.name))
 
-    md_parts: list[str] = []
-    all_sources: list[dict] = []
-    seen_urls: set[str] = set()
-    all_verdicts: list[dict] = []
-
-    for idx, node in enumerate(nodes, start=1):
-        md_parts.append("#" * min(node["level"], 6) + " " + node["title"])
-        if not node["reqs"]:
-            continue
-
-        title = node["title"]
-        await on_progress(f"[{idx}/{len(nodes)}] 生成检索词：{title}")
-        queries = await generate_queries_from_profile(
-            provider, title, node["reqs"], profile, queries_per_section
+    fill_sections = resolve_web_fill_sections(nodes, chapter_keywords)
+    if not fill_sections:
+        raise ValueError(
+            f"模板「{template_path.name}」已配置章节 {_chapter_summary(chapter_keywords)}，"
+            "但在 docx 中未匹配到对应章或其子标题。"
         )
 
-        await on_progress(f"[{idx}/{len(nodes)}] 联网检索：{title}")
-        section_sources = await _search_and_collect(
-            web_search, queries, seen_urls, all_sources, max_sources
-        )
+    await on_progress(
+        f"模板解析出 {len(nodes)} 个节点；"
+        f"配置章节「{_chapter_summary(chapter_keywords)}」下 "
+        f"{len(fill_sections)} 个子标题需联网填充。"
+    )
 
-        await on_progress(f"[{idx}/{len(nodes)}] 带源改写：{title}")
-        if section_sources:
-            content = await fill_from_web(provider, title, node["reqs"], section_sources, profile)
-            verdicts = await verify_citations(provider, content, section_sources)
-            all_verdicts.extend(verdicts)
-        else:
-            content = "（未检索到与目标公司相关的可靠来源）"
-        md_parts.append(content)
+    md_parts, all_sources, all_verdicts = await _render_configured_report(
+        nodes=nodes,
+        fill_sections=fill_sections,
+        provider=provider,
+        web_search=web_search,
+        queries_per_section=queries_per_section,
+        max_sources=max_sources,
+        on_progress=on_progress,
+        profile=profile,
+    )
 
     if all_sources:
         md_parts.append("# 来源")
@@ -348,49 +417,35 @@ async def run_research_with_source(
     max_sources: int,
     on_progress: NotifyFn,
 ) -> tuple[str, list[dict]]:
+    template_dir = template_path.parent
     nodes = parse_template_nodes(template_path)
-    grounded_count = sum(n["grounded"] for n in nodes)
+    chapter_keywords = get_fill_chapters(template_dir, template_path.name)
+    if not chapter_keywords:
+        raise ValueError(format_config_hint(template_dir, template_path.name))
+
+    fill_sections = resolve_web_fill_sections(nodes, chapter_keywords)
+    if not fill_sections:
+        raise ValueError(
+            f"模板「{template_path.name}」已配置章节 {_chapter_summary(chapter_keywords)}，"
+            "但在 docx 中未匹配到对应章或其子标题。"
+        )
+
     await on_progress(
-        f"模板解析出 {len(nodes)} 个节点，其中 {grounded_count} 个需联网填充。"
+        f"模板解析出 {len(nodes)} 个节点；"
+        f"配置章节「{_chapter_summary(chapter_keywords)}」下 "
+        f"{len(fill_sections)} 个子标题需联网填充。"
     )
 
-    md_parts: list[str] = []
-    all_sources: list[dict] = []
-    seen_urls: set[str] = set()
-    all_verdicts: list[dict] = []
-
-    for idx, node in enumerate(nodes, start=1):
-        title = node["title"]
-        level = node["level"]
-        md_parts.append("#" * min(level, 6) + " " + title)
-        if not node["reqs"]:
-            continue
-
-        if node["grounded"]:
-            await on_progress(f"[{idx}/{len(nodes)}] 生成检索词：{title}")
-            queries = await generate_queries_with_source(
-                provider, title, node["reqs"], source_text, queries_per_section
-            )
-
-            await on_progress(f"[{idx}/{len(nodes)}] 联网检索：{title}")
-            section_sources = await _search_and_collect(
-                web_search, queries, seen_urls, all_sources, max_sources
-            )
-
-            await on_progress(f"[{idx}/{len(nodes)}] 带源改写：{title}")
-            if section_sources:
-                content = await grounded_fill(
-                    provider, title, node["reqs"], source_text, section_sources
-                )
-                verdicts = await verify_citations(provider, content, section_sources)
-                all_verdicts.extend(verdicts)
-            else:
-                content = await source_only_fill(provider, title, node["reqs"], source_text)
-            md_parts.append(content)
-        else:
-            await on_progress(f"[{idx}/{len(nodes)}] 源文件填充：{title}")
-            content = await source_only_fill(provider, title, node["reqs"], source_text)
-            md_parts.append(content)
+    md_parts, all_sources, all_verdicts = await _render_configured_report(
+        nodes=nodes,
+        fill_sections=fill_sections,
+        provider=provider,
+        web_search=web_search,
+        queries_per_section=queries_per_section,
+        max_sources=max_sources,
+        on_progress=on_progress,
+        source_text=source_text,
+    )
 
     if all_sources:
         md_parts.append("# 来源")

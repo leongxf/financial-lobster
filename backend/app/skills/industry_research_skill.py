@@ -78,8 +78,7 @@ class IndustryResearchSkill:
         if not templates:
             await ctx.client.send_text(
                 operator_id,
-                "未配置行业研究模板：请把模板 docx 放到 RESEARCH_TEMPLATE_DIR 目录，"
-                "或配置 RESEARCH_TEMPLATE_PATH 兜底模板后重试。",
+                "未配置行业研究模板：请把模板 docx 放到 RESEARCH_TEMPLATE_DIR 目录后重试。",
             )
             return
 
