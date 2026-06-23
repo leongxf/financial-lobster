@@ -2,9 +2,11 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+import httpx
+
 from app.services.analysis_cache import AnalysisCache, ChunkCacheKey, sha256_text
 from app.services.document_parser import ParsedDocument, ParsedPage
-from app.services.llm_provider import LLMProvider, TokenUsage
+from app.services.llm_provider import LLMError, LLMProvider, TokenUsage
 
 ProgressCallback = Callable[[str], Awaitable[None]] | None
 
@@ -133,6 +135,7 @@ async def generate_financial_summary_markdown(
     reduce_group_size: int,
     reduce_max_chars: int,
     map_concurrency: int,
+    map_chunk_retries: int = 3,
     cache: AnalysisCache | None = None,
     on_progress: ProgressCallback = None,
 ) -> FinancialSummaryResult:
@@ -176,6 +179,7 @@ async def generate_financial_summary_markdown(
                 on_progress,
                 total,
                 document.file_path.name,
+                map_chunk_retries=map_chunk_retries,
             )
             for chunk in chunks
         )
@@ -224,19 +228,49 @@ async def _map_one(
     on_progress: ProgressCallback,
     total: int,
     source_file: str,
+    *,
+    map_chunk_retries: int = 3,
 ) -> tuple[FinancialSummaryResult, bool]:
     if cache is not None and cache_key is not None:
         cached = cache.get_chunk(cache_key)
         if cached is not None:
             if on_progress:
-                await on_progress(f"片段 {chunk.index}/{total} 命中缓存，跳过模型调用。")
+                await on_progress(
+                    f"片段 {chunk.index}/{total} 命中缓存，复用已有结果。"
+                )
             return FinancialSummaryResult(markdown=cached.markdown, usage=TokenUsage()), True
 
-    async with sem:
-        if on_progress:
-            pages = f"第 {chunk.start_page}-{chunk.end_page} 页"
-            await on_progress(f"正在分析片段 {chunk.index}/{total}（{pages}）...")
-        result = await summarize_chunk(chunk, provider)
+    retries = max(1, map_chunk_retries)
+    last_error: Exception | None = None
+    for attempt in range(retries):
+        try:
+            async with sem:
+                if on_progress:
+                    pages = f"第 {chunk.start_page}-{chunk.end_page} 页"
+                    if attempt == 0:
+                        await on_progress(
+                            f"正在分析片段 {chunk.index}/{total}（{pages}）..."
+                        )
+                    else:
+                        await on_progress(
+                            f"片段 {chunk.index}/{total} 调用失败，"
+                            f"正在重试（{attempt + 1}/{retries}）..."
+                        )
+                result = await summarize_chunk(chunk, provider)
+            break
+        except LLMError as exc:
+            last_error = exc
+            if exc.category not in ("rate_limit", "server") or attempt >= retries - 1:
+                raise
+            await asyncio.sleep(min(8, 2 ** attempt))
+        except httpx.TransportError as exc:
+            last_error = exc
+            if attempt >= retries - 1:
+                raise
+            await asyncio.sleep(min(8, 2 ** attempt))
+    else:
+        assert last_error is not None
+        raise last_error
 
     if cache is not None and cache_key is not None:
         cache.set_chunk(

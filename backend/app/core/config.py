@@ -39,7 +39,11 @@ class Settings(BaseSettings):
     llm_timeout_ms: int = 180_000
     llm_max_tokens: int = 4000
     llm_temperature: float = 0.2
+    # 部分模型（如 glm-5）仅支持 stream=true；开启后 chat 走 SSE 流式并拼成完整回复。
+    llm_stream: bool = False
     llm_chunk_chars: int = 18_000
+    # Map 阶段单分片 LLM 失败时的重试次数（仅 rate_limit/server/传输层错误）。
+    llm_map_chunk_retries: int = 3
     # 分析页数上限：绑定约束，超出则截断并在报告中显式提示，避免静默丢页。
     llm_max_pages: int = 200
     # 分层归并时每组合并的分片笔记数；笔记超过该数则先分组归并再终合，避免一次性 reduce 爆上下文。

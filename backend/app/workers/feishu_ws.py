@@ -98,6 +98,19 @@ def format_model_info(settings: Settings) -> str:
     return "未配置 LLM（仅文本提取预览）"
 
 
+def build_chat_llm_config(settings: Settings) -> LLMConfig:
+    return LLMConfig(
+        provider=settings.llm_provider,
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        model=settings.llm_model,
+        timeout_ms=settings.llm_timeout_ms,
+        max_tokens=settings.llm_max_tokens,
+        temperature=settings.llm_temperature,
+        stream=settings.llm_stream,
+    )
+
+
 async def suggest_followup_question(
     provider: LLMProvider,
     *,
@@ -510,15 +523,7 @@ async def process_file_message_async(
         cache_misses = 0
         if settings.llm_api_key:
             provider = build_chat_provider(
-                LLMConfig(
-                    provider=settings.llm_provider,
-                    base_url=settings.llm_base_url,
-                    api_key=settings.llm_api_key,
-                    model=settings.llm_model,
-                    timeout_ms=settings.llm_timeout_ms,
-                    max_tokens=settings.llm_max_tokens,
-                    temperature=settings.llm_temperature,
-                ),
+                build_chat_llm_config(settings),
                 settings.fallback_models,
             )
             task_store.update_task(
@@ -544,6 +549,7 @@ async def process_file_message_async(
                 reduce_group_size=settings.llm_reduce_group_size,
                 reduce_max_chars=settings.llm_reduce_max_chars,
                 map_concurrency=settings.llm_map_concurrency,
+                map_chunk_retries=settings.llm_map_chunk_retries,
                 cache=analysis_cache,
                 on_progress=notify,
             )
@@ -865,15 +871,7 @@ async def process_question_async(
 
     try:
         provider = build_chat_provider(
-            LLMConfig(
-                provider=settings.llm_provider,
-                base_url=settings.llm_base_url,
-                api_key=settings.llm_api_key,
-                model=settings.llm_model,
-                timeout_ms=settings.llm_timeout_ms,
-                max_tokens=settings.llm_max_tokens,
-                temperature=settings.llm_temperature,
-            ),
+            build_chat_llm_config(settings),
             settings.fallback_models,
         )
         history = conversation_store.recent_history(

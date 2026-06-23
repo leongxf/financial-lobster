@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, replace
 
@@ -22,6 +23,7 @@ class LLMConfig:
     timeout_ms: int
     max_tokens: int
     temperature: float
+    stream: bool = False
 
 
 @dataclass(frozen=True)
@@ -147,6 +149,13 @@ def _classify_llm_error(status_code: int, body: str) -> tuple[str, str]:
             "请检查 LLM_MODEL 配置。",
         )
 
+    if has("only support stream", "enable the stream parameter", "stream mode"):
+        return (
+            "bad_request",
+            "处理失败：当前模型仅支持流式调用。"
+            "请在 .env 设置 LLM_STREAM=true 后重试。",
+        )
+
     if status_code >= 500:
         return (
             "server",
@@ -184,6 +193,72 @@ class LLMProvider:
     def __init__(self, config: LLMConfig) -> None:
         self.config = config
 
+    def _chat_payload(self, messages: list[dict[str, str]], *, stream: bool) -> dict:
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+        }
+        if stream:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+        return payload
+
+    async def _complete_stream(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        headers: dict[str, str],
+        messages: list[dict[str, str]],
+    ) -> LLMResult:
+        content_parts: list[str] = []
+        usage = TokenUsage()
+        finish_reason = "stop"
+
+        async with client.stream(
+            "POST",
+            url,
+            headers=headers,
+            json=self._chat_payload(messages, stream=True),
+        ) as response:
+            if response.status_code >= 400:
+                body = (await response.aread()).decode("utf-8", errors="replace")
+                category, friendly = _classify_llm_error(response.status_code, body)
+                raise LLMError(
+                    friendly,
+                    category=category,
+                    status_code=response.status_code,
+                    body=body,
+                )
+
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[len("data:") :].strip()
+                if not data_str or data_str == "[DONE]":
+                    continue
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices") or []
+                if choices:
+                    choice = choices[0]
+                    delta = choice.get("delta") or {}
+                    piece = delta.get("content")
+                    if piece:
+                        content_parts.append(piece)
+                    if choice.get("finish_reason"):
+                        finish_reason = str(choice["finish_reason"])
+                if chunk.get("usage"):
+                    usage += _parse_usage(chunk["usage"])
+
+        content = "".join(content_parts)
+        if not content:
+            raise RuntimeError("LLM 流式响应缺少 content")
+        return LLMResult(content=content, usage=usage, finish_reason=finish_reason)
+
     async def complete(
         self,
         messages: list[dict[str, str]],
@@ -195,23 +270,23 @@ class LLMProvider:
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         read_timeout = self.config.timeout_ms / 1000
         timeout = httpx.Timeout(connect=15.0, read=read_timeout, write=15.0, pool=15.0)
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
         last_error: Exception | None = None
 
         for attempt in range(max_retries + 1):
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
+                    if self.config.stream:
+                        return await self._complete_stream(
+                            client, url, headers, messages
+                        )
                     response = await client.post(
                         url,
-                        headers={
-                            "Authorization": f"Bearer {self.config.api_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "model": self.config.model,
-                            "messages": messages,
-                            "temperature": self.config.temperature,
-                            "max_tokens": self.config.max_tokens,
-                        },
+                        headers=headers,
+                        json=self._chat_payload(messages, stream=False),
                     )
                     _raise_for_status_with_body(response)
                     data = response.json()
