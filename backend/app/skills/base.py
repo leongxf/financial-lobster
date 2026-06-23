@@ -163,6 +163,20 @@ class SkillRouter:
 
         if msg.sender_id:
             state = ctx.session_store.get(msg.sender_id)
+            if state and state.get("awaiting") == "summary_in_progress":
+                from app.workers.feishu_ws import (
+                    SUMMARY_IN_PROGRESS_FILE_MESSAGE,
+                    SUMMARY_IN_PROGRESS_MESSAGE,
+                )
+
+                text = (
+                    SUMMARY_IN_PROGRESS_FILE_MESSAGE
+                    if msg.msg_type == "file"
+                    else SUMMARY_IN_PROGRESS_MESSAGE
+                )
+                await ctx.client.reply_text(msg.message_id, text)
+                return
+
             if state and state.get("awaiting"):
                 skill = self.registry.get(state["active_skill"])
                 if skill is not None:
@@ -172,20 +186,23 @@ class SkillRouter:
                     return
 
         if msg.msg_type == "file":
-            skill = self.registry.get("financial_summary")
-            if skill is None:
+            from app.services.cards import build_file_summary_confirm_card
+            from app.workers.feishu_ws import check_upload_allowed
+
+            reject = check_upload_allowed(ctx.settings, msg.file_name, msg.file_size)
+            if reject:
+                await ctx.client.reply_text(msg.message_id, reject)
                 return
-            await skill.run(
-                ctx=ctx,
-                operator_id=msg.sender_id,
-                chat_id=msg.chat_id,
-                args={
+
+            card = build_file_summary_confirm_card(
+                {
                     "message_id": msg.message_id,
                     "file_key": msg.file_key,
                     "file_name": msg.file_name,
                     "file_size": msg.file_size,
-                },
+                }
             )
+            await ctx.client.reply_card(msg.message_id, card)
             return
 
         if msg.msg_type == "text" and msg.text:

@@ -23,7 +23,7 @@ def build_capability_menu(buttons: list[dict]) -> dict:
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": "点选下面的功能，或直接发文件 / 发问题给我。",
+                    "content": "点选下面的功能，或直接发文件 / 发问题给我。\n\n发文件会先确认是否进行**文件摘要**；摘要完成后才可追问。",
                 },
             },
             {
@@ -245,4 +245,98 @@ def build_done_card(message: str) -> dict:
     return {
         "config": {"wide_screen_mode": True},
         "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": message}}],
+    }
+
+
+def _format_file_size(num_bytes: int | None) -> str:
+    if num_bytes is None:
+        return ""
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024:.1f}KB"
+    return f"{num_bytes / (1024 * 1024):.1f}MB"
+
+
+def build_file_upload_prompt_card() -> dict:
+    """菜单/能力卡入口：引导用户在会话中发送文件（卡片内无法上传）。"""
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": "文件摘要"},
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        "请在**本对话**中直接发送文件：\n"
+                        "- 支持 PDF / Word(.docx) / Excel(.xlsx) / CSV\n"
+                        "- 单文件 ≤ 20MB\n"
+                        "- 扫描件 PDF 暂不支持\n\n"
+                        "发送后我会自动开始分析；**摘要完成后**才可追问。"
+                    ),
+                },
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    _button("取消", {"action": "cancel"}, "default"),
+                ],
+            },
+        ],
+    }
+
+
+def build_file_summary_confirm_card(args: dict[str, Any]) -> dict:
+    """直接上传入口：收到文件后请用户确认是否开始摘要。"""
+    file_name = args.get("file_name") or "未命名文件"
+    size_text = _format_file_size(args.get("file_size"))
+    size_line = f"- 大小：约 {size_text}\n" if size_text else ""
+    detail = (
+        f"收到文件，确认开始**文件摘要**？\n\n"
+        f"- 文件：{file_name}\n"
+        f"{size_line}\n"
+        "将调用 LLM 分片分析，耗时与 token 消耗取决于页数。\n"
+        "**摘要完成后**才可追问。"
+    )
+    return build_confirm_card("financial_summary", "确认文件摘要？", detail, args)
+
+
+def build_progress_card(
+    *,
+    title: str,
+    status: str,
+    completed: int = 0,
+    total: int = 0,
+) -> dict:
+    """分析进度卡：配合 PATCH message_id 原地更新（需 config.update_multi）。"""
+    if total > 0:
+        progress_line = f"进度：**{completed}/{total}**"
+    else:
+        progress_line = ""
+    content = status if not progress_line else f"{status}\n\n{progress_line}"
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": content}},
+        ],
+    }
+
+
+def build_summary_complete_card(*, hint: str) -> dict:
+    """摘要完成后的追问引导卡。"""
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {
+            "template": "turquoise",
+            "title": {"tag": "plain_text", "content": "文件摘要已完成"},
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": hint}},
+        ],
     }

@@ -65,6 +65,7 @@ docker compose down
 - `FEISHU_APP_ID`
 - `FEISHU_APP_SECRET`
 - 事件订阅方式：**使用长连接接收事件**
-- 权限：接收消息、读取消息文件、回复消息
+- 权限：接收消息、读取消息中的文件、回复消息、**更新消息（im:message:update，进度卡需要）**
+- 自定义菜单：可添加 `event_key=financial_summary`、文案「文件摘要」，点击后发上传引导卡
 
 MVP 上传入口是飞书机器人消息。H5/Web 上传不是 MVP 入口。

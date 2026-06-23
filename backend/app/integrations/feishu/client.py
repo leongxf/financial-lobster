@@ -141,8 +141,8 @@ class FeishuClient:
         receive_id: str,
         card: dict,
         receive_id_type: str = "open_id",
-    ) -> None:
-        """主动给用户/群发送交互卡片。"""
+    ) -> str | None:
+        """主动给用户/群发送交互卡片。返回 message_id（失败时 None）。"""
         token = await self.get_tenant_access_token()
 
         async def _send() -> httpx.Response:
@@ -158,6 +158,35 @@ class FeishuClient:
                         "receive_id": receive_id,
                         "msg_type": "interactive",
                         "content": json.dumps(card, ensure_ascii=False),
+                    },
+                )
+                resp.raise_for_status()
+                return resp
+
+        response = await _with_retry(_send)
+        data = response.json()
+        message_id = (data.get("data") or {}).get("message_id")
+        return str(message_id) if message_id else None
+
+    async def patch_card(self, message_id: str, card: dict) -> None:
+        """全量更新已发送的共享卡片（需 card.config.update_multi=true）。"""
+        payload = dict(card)
+        config = dict(payload.get("config") or {})
+        config["update_multi"] = True
+        payload["config"] = config
+
+        token = await self.get_tenant_access_token()
+
+        async def _send() -> httpx.Response:
+            async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
+                resp = await client.patch(
+                    f"{self.base_url}/im/v1/messages/{message_id}",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json; charset=utf-8",
+                    },
+                    json={
+                        "content": json.dumps(payload, ensure_ascii=False),
                     },
                 )
                 resp.raise_for_status()

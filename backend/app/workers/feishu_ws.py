@@ -22,7 +22,12 @@ from app.core.logging import configure_logging
 from app.integrations.feishu.client import FeishuClient
 from app.integrations.feishu.events import extract_file_message, extract_message_brief
 from app.services.analysis_cache import AnalysisCache, sha256_file
-from app.services.cards import build_clear_memory_confirm_card, build_done_card
+from app.services.cards import (
+    build_clear_memory_confirm_card,
+    build_done_card,
+    build_progress_card,
+    build_summary_complete_card,
+)
 from app.services.conversation_store import ConversationStore
 from app.services.document_parser import parse_document
 from app.services.event_dedup import EventDeduplicator
@@ -59,6 +64,13 @@ from app.tools.web_search import WebSearchTool
 
 logger = logging.getLogger(__name__)
 REPORT_TEXT_MAX_CHARS = 3500
+
+SUMMARY_IN_PROGRESS_MESSAGE = (
+    "正在生成文件摘要，请稍候。完成后我会通知你，届时可直接提问。"
+)
+SUMMARY_IN_PROGRESS_FILE_MESSAGE = (
+    "当前有文件正在生成摘要，请等待完成后再上传新文件。"
+)
 
 
 def build_embedding_provider(settings: Settings) -> LLMProvider:
@@ -143,6 +155,28 @@ def build_ack_message(settings: Settings, file_name: str | None) -> str:
 
 def _format_size(num_bytes: int) -> str:
     return f"{num_bytes / (1024 * 1024):.1f}MB"
+
+
+def mark_summary_in_progress(session_store: SessionStore, sender_id: str, task_id: str) -> None:
+    session_store.set_active(
+        sender_id,
+        "financial_summary",
+        awaiting="summary_in_progress",
+        args={"task_id": task_id},
+    )
+
+
+def clear_summary_session(session_store: SessionStore, sender_id: str | None) -> None:
+    if not sender_id:
+        return
+    state = session_store.get(sender_id)
+    if state and state.get("awaiting") == "summary_in_progress":
+        session_store.clear(sender_id)
+
+
+def is_summary_in_progress(session_store: SessionStore, sender_id: str) -> bool:
+    state = session_store.get(sender_id)
+    return bool(state and state.get("awaiting") == "summary_in_progress")
 
 
 def check_upload_allowed(
@@ -260,9 +294,36 @@ async def process_file_message_async(
     task_store = TaskStore(settings.task_storage_dir)
     analysis_cache = AnalysisCache(settings.analysis_cache_dir)
     conversation_store = build_conversation_store(settings)
+    session_store = SessionStore(settings.session_storage_dir)
     safe_name = file_name or "uploaded-file"
     storage_dir = Path(settings.local_storage_dir) / message_id
     target_path = storage_dir / safe_name
+    progress_message_id: str | None = None
+    progress_state = {"completed": 0, "total": 0}
+    last_progress_patch = 0.0
+
+    async def patch_progress(status: str, *, force: bool = False) -> None:
+        nonlocal last_progress_patch
+        if not progress_message_id:
+            return
+        now = time.time()
+        if not force and now - last_progress_patch < 1.0:
+            return
+        last_progress_patch = now
+        try:
+            await client.patch_card(
+                progress_message_id,
+                build_progress_card(
+                    title="文件摘要",
+                    status=status,
+                    completed=progress_state["completed"],
+                    total=progress_state["total"],
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "failed to patch progress card for %s", message_id, exc_info=True
+            )
 
     async def notify(text: str) -> None:
         # 进度通知是尽力而为：飞书瞬时网络抖动导致的发送失败不应中断已在进行的分析。
@@ -272,6 +333,15 @@ async def process_file_message_async(
             logger.warning(
                 "failed to send progress notification for %s", message_id, exc_info=True
             )
+        chunk_match = re.search(r"片段 (\d+)/(\d+)", text)
+        if chunk_match:
+            progress_state["completed"] = int(chunk_match.group(1))
+            progress_state["total"] = int(chunk_match.group(2))
+        elif "分层归并" in text or "合成最终" in text:
+            if progress_state["total"]:
+                progress_state["completed"] = progress_state["total"]
+        status_line = text.strip().splitlines()[0] if text.strip() else text
+        await patch_progress(status_line)
 
     try:
         task_store.create_task(
@@ -282,6 +352,12 @@ async def process_file_message_async(
             model=settings.llm_model,
             provider=settings.llm_provider,
         )
+        if sender_id:
+            mark_summary_in_progress(session_store, sender_id, task_id)
+            progress_message_id = await client.send_card(
+                sender_id,
+                build_progress_card(title="文件摘要", status="准备处理…"),
+            )
 
         # 上传门禁：下载前先按类型白名单与已知大小拦截，避免浪费带宽/磁盘。
         reject_reason = check_upload_allowed(settings, file_name, file_size)
@@ -562,9 +638,18 @@ async def process_file_message_async(
                 )
                 if suggested:
                     example_question = suggested
-            await notify(
-                f"你现在可以直接发文字向我追问这个文件的内容，例如「{example_question}」。"
+            hint = (
+                f"你现在可以直接发文字向我追问这个文件的内容，"
+                f"例如「{example_question}」。"
             )
+            await patch_progress("分析完成，报告已发送。", force=True)
+            if sender_id:
+                await client.send_card(
+                    sender_id,
+                    build_summary_complete_card(hint=hint),
+                )
+            else:
+                await notify(hint)
     except httpx.ReadTimeout:
         logger.exception("LLM timeout while processing file message %s", message_id)
         task_store.update_task(
@@ -603,6 +688,8 @@ async def process_file_message_async(
             error=str(exc),
         )
         await notify(f"处理失败：{exc}")
+    finally:
+        clear_summary_session(session_store, sender_id)
 
 
 def process_file_message(
@@ -713,9 +800,14 @@ async def process_question_async(
     maybe_purge_user_memory(settings, sender_id)
     client = FeishuClient(settings.feishu_app_id, settings.feishu_app_secret)
     conversation_store = build_conversation_store(settings)
+    session_store = SessionStore(settings.session_storage_dir)
 
     async def notify(text: str) -> None:
         await client.reply_text(message_id, text)
+
+    if is_summary_in_progress(session_store, sender_id):
+        await notify(SUMMARY_IN_PROGRESS_MESSAGE)
+        return
 
     if not settings.llm_api_key:
         await notify("未配置 LLM_API_KEY，暂时无法回答追问。")
