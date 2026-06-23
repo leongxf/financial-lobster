@@ -93,10 +93,17 @@ class SkillRegistry:
 
 
 def _confirm_detail(skill: Skill, args: dict) -> str:
+    template_line = f"模板：{args['template']}\n" if args.get("template") else ""
     if args.get("company"):
-        return f"目标公司：{args['company']}\n\n联网研究耗时较长且消耗 token，确认后开始执行。"
+        return (
+            f"{template_line}目标公司：{args['company']}\n\n"
+            "联网研究耗时较长且消耗 token，确认后开始执行。"
+        )
     if args.get("file_id"):
-        return "将基于您选择的文件进行联网行业研究，耗时较长且消耗 token，确认后开始执行。"
+        return (
+            f"{template_line}将基于您选择的文件进行联网行业研究，"
+            "耗时较长且消耗 token，确认后开始执行。"
+        )
     return "联网研究耗时较长且消耗 token，确认后开始执行。"
 
 
@@ -139,6 +146,17 @@ class SkillRouter:
             chat_id=ca.chat_id,
             args=ca.args,
         )
+
+    async def route_menu_async(self, open_id: str, event_key: str) -> None:
+        """自定义菜单点击入口。约定 event_key == skill_id，直接触发该 Skill 的起始流程。"""
+        if not open_id or not event_key:
+            return
+        ctx = self.ctx_factory()
+        skill = self.registry.get(event_key)
+        if skill is None:
+            await ctx.client.send_text(open_id, "该功能暂不可用。")
+            return
+        await skill.run(ctx=ctx, operator_id=open_id, chat_id=None, args={})
 
     async def route_message_async(self, msg: IncomingMessage) -> None:
         ctx = self.ctx_factory()

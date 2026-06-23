@@ -9,6 +9,7 @@ from pathlib import Path
 
 import httpx
 import lark_oapi as lark
+from lark_oapi.api.application.v6 import P2ApplicationBotMenuV6
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTrigger,
@@ -983,6 +984,11 @@ async def route_card_async(settings: Settings, ca) -> None:
     await router.route_card_async(ca)
 
 
+async def route_menu_async(settings: Settings, open_id: str, event_key: str) -> None:
+    router, _ = create_skill_router(settings)
+    await router.route_menu_async(open_id, event_key)
+
+
 def start_message_processing(settings: Settings, msg: IncomingMessage) -> None:
     thread = threading.Thread(
         target=lambda: asyncio.run(route_message_async(settings, msg)),
@@ -994,6 +1000,14 @@ def start_message_processing(settings: Settings, msg: IncomingMessage) -> None:
 def start_card_action_processing(settings: Settings, ca) -> None:
     thread = threading.Thread(
         target=lambda: asyncio.run(route_card_async(settings, ca)),
+        daemon=True,
+    )
+    thread.start()
+
+
+def start_menu_processing(settings: Settings, open_id: str, event_key: str) -> None:
+    thread = threading.Thread(
+        target=lambda: asyncio.run(route_menu_async(settings, open_id, event_key)),
         daemon=True,
     )
     thread.start()
@@ -1037,6 +1051,29 @@ def handle_card_action(data: P2CardActionTrigger, settings: Settings) -> P2CardA
             "card": {"type": "raw", "data": build_done_card("已收到，正在处理…")},
         }
     )
+
+
+def handle_bot_menu(data: P2ApplicationBotMenuV6, settings: Settings) -> None:
+    """处理自定义菜单点击事件：按 event_key 路由到对应 Skill 的起始流程。"""
+    from app.integrations.feishu.events import extract_bot_menu
+
+    menu = extract_bot_menu(data)
+    if menu is None or not menu.operator_id:
+        logger.info("ignored bot menu event without operator/event_key")
+        return
+
+    # 去重：快速重复点击同一菜单（同秒）只处理一次。
+    dedup = EventDeduplicator(settings.card_event_dedup_dir)
+    dedup_key = f"menu:{menu.operator_id}:{menu.event_key}:{menu.timestamp}"
+    if menu.timestamp is not None and not dedup.mark_if_new(dedup_key):
+        logger.info("ignored duplicate bot menu event", extra={"dedup_key": dedup_key})
+        return
+
+    logger.info(
+        "received feishu bot menu event",
+        extra={"operator_id": menu.operator_id, "event_key": menu.event_key},
+    )
+    start_menu_processing(settings, menu.operator_id, menu.event_key)
 
 
 def handle_message_receive(data: P2ImMessageReceiveV1, settings: Settings) -> None:
@@ -1090,10 +1127,14 @@ def main() -> None:
     def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         return handle_card_action(data, settings)
 
+    def on_bot_menu(data: P2ApplicationBotMenuV6) -> None:
+        handle_bot_menu(data, settings)
+
     event_handler = (
         lark.EventDispatcherHandler.builder("", "")
         .register_p2_im_message_receive_v1(on_message_receive)
         .register_p2_card_action_trigger(on_card_action)
+        .register_p2_application_bot_menu_v6(on_bot_menu)
         .build()
     )
 

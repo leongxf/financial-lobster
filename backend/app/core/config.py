@@ -85,7 +85,9 @@ class Settings(BaseSettings):
     search_max_sources: int = 8
     search_queries_per_section: int = 3
 
-    # 行业研究默认模板 docx 路径（必填方可执行行业研究）
+    # 行业研究模板目录：扫描该目录下的 *.docx 作为可选模板，供用户点选。
+    research_template_dir: str = "storage/templates"
+    # 行业研究兜底模板 docx 路径：当模板目录为空时回退使用（向后兼容旧单模板配置）。
     research_template_path: str = ""
 
     # 会话状态 / 卡片回调去重

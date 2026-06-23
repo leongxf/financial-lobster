@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from app.services.cards import build_confirm_card
+from app.services.cards import build_confirm_card, build_template_select_card
 from app.services.industry_research import (
     build_profile,
     format_verification_summary,
@@ -12,6 +12,7 @@ from app.services.industry_research import (
 )
 from app.services.llm_provider import LLMConfig, build_chat_provider
 from app.services.qa_service import load_pages
+from app.services.templates import list_research_templates, resolve_template_path
 from app.skills.base import SkillButton, SkillContext
 
 REPORT_TEXT_MAX_CHARS = 3500
@@ -46,7 +47,10 @@ class IndustryResearchSkill:
         )
 
     def should_confirm(self, args: dict) -> bool:
-        return bool(args.get("file_id") or args.get("company"))
+        # 仅当「模板 + 目标」都齐备时才弹确认卡；否则先让 run() 引导选模板/填目标。
+        return bool(args.get("template")) and bool(
+            args.get("file_id") or args.get("company")
+        )
 
     async def run(
         self,
@@ -66,14 +70,39 @@ class IndustryResearchSkill:
             )
             return
 
-        template_path = Path(ctx.settings.research_template_path)
-        if not template_path.exists():
+        templates = list_research_templates(ctx.settings)
+        if not templates:
             await ctx.client.send_text(
                 operator_id,
-                "未配置行业研究模板（RESEARCH_TEMPLATE_PATH），请联系管理员。",
+                "未配置行业研究模板：请把模板 docx 放到 RESEARCH_TEMPLATE_DIR 目录，"
+                "或配置 RESEARCH_TEMPLATE_PATH 兜底模板后重试。",
             )
             return
 
+        # 第一步：尚未选模板 → 下发模板选择卡（透传已有 file_id 等上下文）。
+        # 即使只有一个模板也展示选择卡，让用户显式确认要用哪个模板。
+        if not args.get("template"):
+            await ctx.client.send_card(
+                operator_id,
+                build_template_select_card(self.skill_id, templates, carry=args),
+            )
+            return
+
+        template_path = resolve_template_path(ctx.settings, args.get("template"))
+        if template_path is None:
+            await ctx.client.send_text(
+                operator_id,
+                "所选模板已不存在，请重新选择。",
+            )
+            await ctx.client.send_card(
+                operator_id,
+                build_template_select_card(self.skill_id, templates, carry={
+                    k: v for k, v in args.items() if k != "template"
+                }),
+            )
+            return
+
+        # 第二步：已选模板但还没研究目标 → 引导输入公司名或发文件（args 已含 template）。
         if not args.get("file_id") and not args.get("company"):
             ctx.session_store.set_active(
                 operator_id,
@@ -83,10 +112,11 @@ class IndustryResearchSkill:
             )
             await ctx.client.send_text(
                 operator_id,
-                "请输入要研究的公司名，或直接发给我一个文件。",
+                f"已选择模板「{template_path.stem}」。\n请输入要研究的公司名，或直接发给我一个文件。",
             )
             return
 
+        # 第三步：模板 + 目标齐备 → 执行。
         await self._execute_research(ctx, operator_id, args, template_path)
 
     async def resume(
@@ -111,10 +141,12 @@ class IndustryResearchSkill:
             return
 
         merged_args = {**state.get("args", {}), "company": company}
+        template_path = resolve_template_path(ctx.settings, merged_args.get("template"))
+        template_line = f"模板：{template_path.stem}\n" if template_path else ""
         card = build_confirm_card(
             self.skill_id,
             "确认执行行业研究",
-            f"目标公司：{company}\n\n联网研究耗时较长且消耗 token，确认后开始执行。",
+            f"{template_line}目标公司：{company}\n\n联网研究耗时较长且消耗 token，确认后开始执行。",
             merged_args,
         )
         await ctx.client.send_card(msg.sender_id, card)

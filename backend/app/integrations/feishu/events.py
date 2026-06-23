@@ -163,6 +163,32 @@ def extract_message_brief(payload: dict[str, Any]) -> FeishuMessageBrief | None:
 
 
 @dataclass
+class BotMenuEvent:
+    operator_id: str | None
+    event_key: str | None
+    timestamp: int | None = None
+
+
+def extract_bot_menu(data) -> BotMenuEvent | None:
+    """从 P2ApplicationBotMenuV6 提取归一化的菜单点击事件。结构缺失时返回 None。"""
+    event = getattr(data, "event", None)
+    if event is None:
+        return None
+    operator = getattr(event, "operator", None)
+    operator_id_obj = getattr(operator, "operator_id", None) if operator else None
+    open_id = getattr(operator_id_obj, "open_id", None) if operator_id_obj else None
+    event_key = getattr(event, "event_key", None)
+    if not event_key:
+        return None
+    timestamp = getattr(event, "timestamp", None)
+    return BotMenuEvent(
+        operator_id=open_id,
+        event_key=str(event_key),
+        timestamp=int(timestamp) if isinstance(timestamp, int) else None,
+    )
+
+
+@dataclass
 class CardAction:
     operator_id: str | None
     token: str

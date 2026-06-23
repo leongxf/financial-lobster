@@ -68,6 +68,46 @@ def build_next_step_card(file_id: str, buttons: list[dict]) -> dict:
     }
 
 
+def build_template_select_card(
+    skill_id: str,
+    templates: list[dict],
+    carry: dict[str, Any] | None = None,
+) -> dict:
+    """模板选择卡：每个模板一个按钮，点选后继续走对应 Skill 流程。
+
+    carry 用于把已有上下文（如 file_id）透传给下一步；按钮 value 仅放模板名（basename），
+    由 Skill 侧在模板目录内安全解析。
+    """
+    carry = carry or {}
+    actions = [
+        _button(
+            t["label"],
+            {
+                "action": "run_skill",
+                "skill_id": skill_id,
+                "template": t["name"],
+                **carry,
+            },
+        )
+        for t in templates
+    ]
+    actions.append(_button("取消", {"action": "cancel"}, "default"))
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": "请选择行业研究模板"},
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": "点选一个模板，我会按它的提纲展开研究。"},
+            },
+            {"tag": "action", "actions": actions},
+        ],
+    }
+
+
 def build_confirm_card(skill_id: str, title: str, detail: str, args: dict[str, Any]) -> dict:
     """耗时/高成本 Skill 的确认卡。"""
     return {
