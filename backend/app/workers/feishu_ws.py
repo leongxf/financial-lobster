@@ -155,6 +155,19 @@ async def suggest_followup_question(
 def build_initial_progress_status(settings: Settings) -> str:
     return f"正在下载文件…\n\n- 模型：{format_model_info(settings)}"
 
+
+def infer_summary_progress_phase(text: str) -> str | None:
+    """根据进度文案推断摘要流水线当前阶段。"""
+    if "分析完成" in text or "报告已发送" in text:
+        return "report"
+    if "分层归并" in text or "合成最终" in text:
+        return "reduce"
+    if "开始调用模型" in text or "片段" in text:
+        return "map"
+    if "文本提取完成" in text or "文件下载完成" in text:
+        return "download"
+    return None
+
 def _format_size(num_bytes: int) -> str:
     return f"{num_bytes / (1024 * 1024):.1f}MB"
 
@@ -301,7 +314,7 @@ async def process_file_message_async(
     storage_dir = Path(settings.local_storage_dir) / message_id
     target_path = storage_dir / safe_name
     progress_message_id: str | None = None
-    progress_state = {"completed": 0, "total": 0}
+    progress_state = {"completed": 0, "total": 0, "phase": "download"}
     progress_log: list[str] = []
     last_progress_patch = 0.0
 
@@ -325,6 +338,7 @@ async def process_file_message_async(
                     title="文件摘要",
                     status=body or status,
                     file_name=safe_name,
+                    phase=progress_state["phase"],
                     completed=progress_state["completed"],
                     total=progress_state["total"],
                     recent_lines=progress_log[:-1] if not body and len(progress_log) > 1 else None,
@@ -346,6 +360,9 @@ async def process_file_message_async(
                 progress_state["completed"] = progress_state["total"]
 
         status_line = text.strip().splitlines()[0] if text.strip() else text
+        phase = infer_summary_progress_phase(text)
+        if phase is not None:
+            progress_state["phase"] = phase
         if status_line and (not progress_log or progress_log[-1] != status_line):
             progress_log.append(status_line)
 
@@ -380,6 +397,7 @@ async def process_file_message_async(
             title="文件摘要",
             status=build_initial_progress_status(settings),
             file_name=safe_name,
+            phase="download",
         )
         if sender_id:
             progress_message_id = await client.send_card(sender_id, card)
@@ -678,6 +696,7 @@ async def process_file_message_async(
                 f"例如「{example_question}」。"
             )
             await patch_progress("分析完成，报告已发送。", force=True)
+            progress_state["phase"] = "report"
             progress_log.append("分析完成，报告已发送。")
             if sender_id:
                 await client.send_card(

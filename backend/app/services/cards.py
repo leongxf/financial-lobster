@@ -303,22 +303,52 @@ def build_file_summary_confirm_card(args: dict[str, Any]) -> dict:
     return build_confirm_card("financial_summary", "确认文件摘要？", detail, args)
 
 
+# 文件摘要进度卡顶部展示的流水线阶段（顺序固定）。
+_SUMMARY_PIPELINE = (
+    ("download", "① 下载与解析"),
+    ("map", "② 分片分析"),
+    ("reduce", "③ 归并合成"),
+    ("report", "④ 生成报告"),
+)
+_SUMMARY_QA_HINT = (
+    "**追问：** 以上步骤全部完成后才可提问；届时会收到「文件摘要已完成」引导卡。"
+)
+
+
+def format_summary_pipeline_guide(phase: str) -> str:
+    """渲染整体流程说明：已完成 ✅、进行中 ▶️、未开始 ○。"""
+    order = [key for key, _ in _SUMMARY_PIPELINE]
+    current = phase if phase in order else "download"
+    current_idx = order.index(current)
+    lines = []
+    for idx, (_, label) in enumerate(_SUMMARY_PIPELINE):
+        if idx < current_idx:
+            marker = "✅"
+        elif idx == current_idx:
+            marker = "▶️"
+        else:
+            marker = "○"
+        lines.append(f"{marker} {label}")
+    return f"**整体流程**\n" + "\n".join(lines) + f"\n\n{_SUMMARY_QA_HINT}"
+
+
 def build_progress_card(
     *,
     title: str,
     status: str,
     file_name: str | None = None,
+    phase: str = "download",
     completed: int = 0,
     total: int = 0,
     recent_lines: list[str] | None = None,
 ) -> dict:
     """分析进度卡：配合 PATCH message_id 原地更新（需 config.update_multi）。"""
-    parts: list[str] = []
+    parts: list[str] = [format_summary_pipeline_guide(phase), "---"]
     if file_name:
         parts.append(f"**文件：** {file_name}")
-    parts.append(status)
+    parts.append(f"**当前：** {status}")
     if total > 0:
-        parts.append(f"进度：**{completed}/{total}**")
+        parts.append(f"**进度：** {completed}/{total}")
     if recent_lines:
         parts.append("")
         parts.append("**最近步骤**")
@@ -338,6 +368,10 @@ def build_progress_card(
 
 def build_summary_complete_card(*, hint: str) -> dict:
     """摘要完成后的追问引导卡。"""
+    content = (
+        "✅ **全部流程已完成，现在可以追问。**\n\n"
+        f"{hint}"
+    )
     return {
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
@@ -345,6 +379,6 @@ def build_summary_complete_card(*, hint: str) -> dict:
             "title": {"tag": "plain_text", "content": "文件摘要已完成"},
         },
         "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": hint}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": content}},
         ],
     }
