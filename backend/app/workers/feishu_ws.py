@@ -139,19 +139,8 @@ async def suggest_followup_question(
     return question or None
 
 
-def build_ack_message(settings: Settings, file_name: str | None) -> str:
-    display_name = file_name or "未命名文件"
-    return "\n".join(
-        [
-            "已收到文件，开始处理。",
-            "",
-            f"- 模型：{format_model_info(settings)}",
-            f"- 文件：{display_name}",
-            "",
-            "当前步骤：下载文件中...",
-        ]
-    )
-
+def build_initial_progress_status(settings: Settings) -> str:
+    return f"正在下载文件…\n\n- 模型：{format_model_info(settings)}"
 
 def _format_size(num_bytes: int) -> str:
     return f"{num_bytes / (1024 * 1024):.1f}MB"
@@ -300,9 +289,15 @@ async def process_file_message_async(
     target_path = storage_dir / safe_name
     progress_message_id: str | None = None
     progress_state = {"completed": 0, "total": 0}
+    progress_log: list[str] = []
     last_progress_patch = 0.0
 
-    async def patch_progress(status: str, *, force: bool = False) -> None:
+    async def patch_progress(
+        status: str,
+        *,
+        force: bool = False,
+        body: str | None = None,
+    ) -> None:
         nonlocal last_progress_patch
         if not progress_message_id:
             return
@@ -315,9 +310,11 @@ async def process_file_message_async(
                 progress_message_id,
                 build_progress_card(
                     title="文件摘要",
-                    status=status,
+                    status=body or status,
+                    file_name=safe_name,
                     completed=progress_state["completed"],
                     total=progress_state["total"],
+                    recent_lines=progress_log[:-1] if not body and len(progress_log) > 1 else None,
                 ),
             )
         except Exception:
@@ -325,14 +322,8 @@ async def process_file_message_async(
                 "failed to patch progress card for %s", message_id, exc_info=True
             )
 
-    async def notify(text: str) -> None:
-        # 进度通知是尽力而为：飞书瞬时网络抖动导致的发送失败不应中断已在进行的分析。
-        try:
-            await client.reply_text(message_id, text)
-        except Exception:
-            logger.warning(
-                "failed to send progress notification for %s", message_id, exc_info=True
-            )
+    async def notify(text: str, *, force: bool = False) -> None:
+        """进度更新：有进度卡时只 PATCH 卡片，避免刷屏 reply_text。"""
         chunk_match = re.search(r"片段 (\d+)/(\d+)", text)
         if chunk_match:
             progress_state["completed"] = int(chunk_match.group(1))
@@ -340,8 +331,51 @@ async def process_file_message_async(
         elif "分层归并" in text or "合成最终" in text:
             if progress_state["total"]:
                 progress_state["completed"] = progress_state["total"]
+
         status_line = text.strip().splitlines()[0] if text.strip() else text
-        await patch_progress(status_line)
+        if status_line and (not progress_log or progress_log[-1] != status_line):
+            progress_log.append(status_line)
+
+        if progress_message_id:
+            is_error = text.startswith(("无法处理", "处理停止", "处理失败"))
+            await patch_progress(
+                status_line,
+                force=force or is_error,
+                body=text.strip() if is_error else None,
+            )
+            return
+
+        is_error = text.startswith(("无法处理", "处理停止", "处理失败"))
+        if not is_error:
+            logger.debug(
+                "progress update skipped (no progress card) for %s: %s",
+                message_id,
+                status_line,
+            )
+            return
+
+        try:
+            await client.reply_text(message_id, text)
+        except Exception:
+            logger.warning(
+                "failed to send progress notification for %s", message_id, exc_info=True
+            )
+
+    async def start_progress_card() -> None:
+        nonlocal progress_message_id
+        card = build_progress_card(
+            title="文件摘要",
+            status=build_initial_progress_status(settings),
+            file_name=safe_name,
+        )
+        if sender_id:
+            progress_message_id = await client.send_card(sender_id, card)
+        if not progress_message_id:
+            progress_message_id = await client.reply_card(message_id, card)
+        if not progress_message_id:
+            logger.warning("failed to create progress card for %s", message_id)
+        else:
+            progress_log.append("正在下载文件…")
 
     try:
         task_store.create_task(
@@ -354,10 +388,7 @@ async def process_file_message_async(
         )
         if sender_id:
             mark_summary_in_progress(session_store, sender_id, task_id)
-            progress_message_id = await client.send_card(
-                sender_id,
-                build_progress_card(title="文件摘要", status="准备处理…"),
-            )
+        await start_progress_card()
 
         # 上传门禁：下载前先按类型白名单与已知大小拦截，避免浪费带宽/磁盘。
         reject_reason = check_upload_allowed(settings, file_name, file_size)
@@ -370,8 +401,6 @@ async def process_file_message_async(
             )
             await notify(reject_reason)
             return
-
-        await notify(build_ack_message(settings, file_name))
 
         task_store.update_task(task_id, status="downloading", event="downloading file")
         downloaded_path = await client.download_message_file(
@@ -643,6 +672,7 @@ async def process_file_message_async(
                 f"例如「{example_question}」。"
             )
             await patch_progress("分析完成，报告已发送。", force=True)
+            progress_log.append("分析完成，报告已发送。")
             if sender_id:
                 await client.send_card(
                     sender_id,

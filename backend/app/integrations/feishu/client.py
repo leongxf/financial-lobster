@@ -47,6 +47,15 @@ async def _with_retry(
     raise RuntimeError("unreachable")  # pragma: no cover
 
 
+def _message_id_from_response(response: httpx.Response) -> str | None:
+    try:
+        data = response.json()
+    except json.JSONDecodeError:
+        return None
+    message_id = (data.get("data") or {}).get("message_id")
+    return str(message_id) if message_id else None
+
+
 class FeishuClient:
     # 进程级 token 缓存（按 app_id 共享于所有实例）。客户端按消息新建，若不缓存则每条
     # 回复/进度都要现拉一次 token，长文件会瞬间把大量连接砸向飞书 auth 接口（引发 ConnectTimeout）。
@@ -117,8 +126,8 @@ class FeishuClient:
 
         await _with_retry(_send)
 
-    async def reply_card(self, message_id: str, card: dict) -> None:
-        """回复一张交互卡片到原消息会话。"""
+    async def reply_card(self, message_id: str, card: dict) -> str | None:
+        """回复一张交互卡片到原消息会话。返回新卡片的 message_id（失败时 None）。"""
         token = await self.get_tenant_access_token()
 
         async def _send() -> httpx.Response:
@@ -134,7 +143,8 @@ class FeishuClient:
                 resp.raise_for_status()
                 return resp
 
-        await _with_retry(_send)
+        response = await _with_retry(_send)
+        return _message_id_from_response(response)
 
     async def send_card(
         self,
@@ -164,9 +174,7 @@ class FeishuClient:
                 return resp
 
         response = await _with_retry(_send)
-        data = response.json()
-        message_id = (data.get("data") or {}).get("message_id")
-        return str(message_id) if message_id else None
+        return _message_id_from_response(response)
 
     async def patch_card(self, message_id: str, card: dict) -> None:
         """全量更新已发送的共享卡片（需 card.config.update_multi=true）。"""

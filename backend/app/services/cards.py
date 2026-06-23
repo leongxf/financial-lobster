@@ -307,15 +307,23 @@ def build_progress_card(
     *,
     title: str,
     status: str,
+    file_name: str | None = None,
     completed: int = 0,
     total: int = 0,
+    recent_lines: list[str] | None = None,
 ) -> dict:
     """分析进度卡：配合 PATCH message_id 原地更新（需 config.update_multi）。"""
+    parts: list[str] = []
+    if file_name:
+        parts.append(f"**文件：** {file_name}")
+    parts.append(status)
     if total > 0:
-        progress_line = f"进度：**{completed}/{total}**"
-    else:
-        progress_line = ""
-    content = status if not progress_line else f"{status}\n\n{progress_line}"
+        parts.append(f"进度：**{completed}/{total}**")
+    if recent_lines:
+        parts.append("")
+        parts.append("**最近步骤**")
+        parts.extend(f"- {line}" for line in recent_lines[-6:])
+    content = "\n\n".join(parts)
     return {
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
