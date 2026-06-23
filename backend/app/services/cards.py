@@ -190,23 +190,23 @@ def build_research_target_input_card(
                         "tag": "input",
                         "name": "company",
                         "required": True,
+                        "label": {
+                            "tag": "plain_text",
+                            "content": "公司名",
+                        },
                         "placeholder": {
                             "tag": "plain_text",
                             "content": "请输入公司名，例如：阿里巴巴",
                         },
                     },
                     {
-                        "tag": "action",
-                        "actions": [
-                            {
-                                "tag": "button",
-                                "text": {"tag": "plain_text", "content": "开始研究"},
-                                "type": "primary",
-                                "action_type": "form_submit",
-                                "name": "submit",
-                                "value": submit_value,
-                            }
-                        ],
+                        # 飞书 form 容器内按钮须直接作为 elements 子项，不能包在 action 容器里。
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "开始研究"},
+                        "type": "primary",
+                        "action_type": "form_submit",
+                        "name": "submit",
+                        "value": submit_value,
                     },
                 ],
             },
