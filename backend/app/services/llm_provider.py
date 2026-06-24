@@ -177,6 +177,27 @@ def _classify_llm_error(status_code: int, body: str) -> tuple[str, str]:
     )
 
 
+def _extract_stream_text(choice: dict) -> str:
+    """从流式 chunk 的 delta 或 message 中提取正文（兼容百炼/OpenAI 等格式）。"""
+    for source in (choice.get("delta") or {}, choice.get("message") or {}):
+        raw = source.get("content")
+        if raw is None:
+            continue
+        if isinstance(raw, str):
+            return raw
+        if isinstance(raw, list):
+            parts: list[str] = []
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if text:
+                    parts.append(str(text))
+            if parts:
+                return "".join(parts)
+    return ""
+
+
 def _raise_for_status_with_body(response: httpx.Response) -> None:
     """非 2xx 时读取响应体并抛出已分类的 LLMError。
 
@@ -208,6 +229,9 @@ class LLMProvider:
             "messages": messages,
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
+            # 百炼思考型模型（qwen3.5-plus 等）默认会消耗 token 做 reasoning，
+            # 流式 delta.content 可能为空；结构化整理/归并不需要思考链。
+            "enable_thinking": False,
         }
         if stream:
             payload["stream"] = True
@@ -254,8 +278,7 @@ class LLMProvider:
                 choices = chunk.get("choices") or []
                 if choices:
                     choice = choices[0]
-                    delta = choice.get("delta") or {}
-                    piece = delta.get("content")
+                    piece = _extract_stream_text(choice)
                     if piece:
                         content_parts.append(piece)
                     if choice.get("finish_reason"):
@@ -264,8 +287,6 @@ class LLMProvider:
                     usage += _parse_usage(chunk["usage"])
 
         content = "".join(content_parts)
-        if not content:
-            raise RuntimeError("LLM 流式响应缺少 content")
         return LLMResult(content=content, usage=usage, finish_reason=finish_reason)
 
     async def complete(
@@ -289,8 +310,16 @@ class LLMProvider:
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     if self.config.stream:
-                        return await self._complete_stream(
+                        stream_result = await self._complete_stream(
                             client, url, headers, messages
+                        )
+                        if stream_result.content:
+                            return stream_result
+                        logger.warning(
+                            "LLM 流式响应 content 为空（model=%s finish=%s），"
+                            "回退为非流式重试",
+                            self.config.model,
+                            stream_result.finish_reason,
                         )
                     response = await client.post(
                         url,
@@ -321,10 +350,12 @@ class LLMProvider:
         if not choices:
             raise RuntimeError(f"LLM 响应缺少 choices：{data}")
 
-        message = choices[0].get("message") or {}
-        content = message.get("content")
+        content = _extract_stream_text(choices[0])
         if not content:
-            raise RuntimeError(f"LLM 响应缺少 content：{data}")
+            finish = choices[0].get("finish_reason") or "unknown"
+            raise RuntimeError(
+                f"LLM 响应缺少 content（model={self.config.model} finish={finish}）"
+            )
 
         finish_reason = str(choices[0].get("finish_reason") or "stop")
         return LLMResult(
@@ -355,6 +386,13 @@ class LLMProvider:
                 convo.append({"role": "assistant", "content": accumulated})
                 convo.append({"role": "user", "content": _CONTINUE_PROMPT})
             result = await self.complete(convo)
+            if not result.content:
+                logger.warning(
+                    "complete_until_done: 第 %s 轮返回空 content（finish=%s），停止续写",
+                    round_index + 1,
+                    result.finish_reason,
+                )
+                break
             parts.append(result.content)
             usage += result.usage
             finish_reason = result.finish_reason
