@@ -192,8 +192,12 @@ async def build_chunk_embeddings(
             return chunks, model
         except LLMError as exc:
             last_error = exc
-            if exc.category == "billing":
-                logger.warning("embedding 模型 %s 额度耗尽，整文件改用下一个模型重算", model)
+            if exc.category in ("billing", "model"):
+                logger.warning(
+                    "embedding 模型 %s 不可用（%s），整文件改用下一个模型重算",
+                    model,
+                    exc.category,
+                )
                 continue
             raise
     assert last_error is not None

@@ -142,6 +142,8 @@ def _classify_llm_error(status_code: int, body: str) -> tuple[str, str]:
         "does not exist",
         "unknown model",
         "无效的model",
+        "模型不存在",
+        "模型代码",
     ):
         return (
             "model",
