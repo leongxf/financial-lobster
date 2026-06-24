@@ -83,33 +83,6 @@ def build_clear_memory_confirm_card() -> dict:
     }
 
 
-def build_next_step_card(file_id: str, buttons: list[dict]) -> dict:
-    """文件分析完成后追发：针对此文件的后续动作。"""
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "template": "turquoise",
-            "title": {"tag": "plain_text", "content": "这个文件接下来做什么？"},
-        },
-        "elements": [
-            {
-                "tag": "action",
-                "actions": [
-                    _button(
-                        b["label"],
-                        {
-                            "action": "run_skill",
-                            "skill_id": b["skill_id"],
-                            "file_id": file_id,
-                        },
-                    )
-                    for b in buttons
-                ],
-            },
-        ],
-    }
-
-
 def build_template_select_card(
     skill_id: str,
     templates: list[dict],
@@ -338,21 +311,12 @@ def build_progress_card(
     status: str,
     file_name: str | None = None,
     phase: str = "download",
-    completed: int = 0,
-    total: int = 0,
-    recent_lines: list[str] | None = None,
 ) -> dict:
     """分析进度卡：配合 PATCH message_id 原地更新（需 config.update_multi）。"""
     parts: list[str] = [format_summary_pipeline_guide(phase), "---"]
     if file_name:
         parts.append(f"**文件：** {file_name}")
     parts.append(f"**当前：** {status}")
-    if total > 0:
-        parts.append(f"**进度：** {completed}/{total}")
-    if recent_lines:
-        parts.append("")
-        parts.append("**最近步骤**")
-        parts.extend(f"- {line}" for line in recent_lines[-6:])
     content = "\n\n".join(parts)
     return {
         "config": {"wide_screen_mode": True, "update_multi": True},
@@ -366,19 +330,42 @@ def build_progress_card(
     }
 
 
-def build_summary_complete_card(*, hint: str) -> dict:
-    """摘要完成后的追问引导卡。"""
+def build_summary_complete_card(
+    *,
+    hint: str,
+    file_id: str | None = None,
+    buttons: list[dict] | None = None,
+) -> dict:
+    """摘要完成后的引导卡：追问提示 + 针对此文件的后续动作按钮。"""
     content = (
         "✅ **全部流程已完成，现在可以追问。**\n\n"
         f"{hint}"
     )
+    elements: list[dict] = [
+        {"tag": "div", "text": {"tag": "lark_md", "content": content}},
+    ]
+    if file_id and buttons:
+        elements.append(
+            {
+                "tag": "action",
+                "actions": [
+                    _button(
+                        b["label"],
+                        {
+                            "action": "run_skill",
+                            "skill_id": b["skill_id"],
+                            "file_id": file_id,
+                        },
+                    )
+                    for b in buttons
+                ],
+            }
+        )
     return {
         "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "template": "turquoise",
             "title": {"tag": "plain_text", "content": "文件摘要已完成"},
         },
-        "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": content}},
-        ],
+        "elements": elements,
     }

@@ -168,6 +168,7 @@ def infer_summary_progress_phase(text: str) -> str | None:
         return "download"
     return None
 
+
 def _format_size(num_bytes: int) -> str:
     return f"{num_bytes / (1024 * 1024):.1f}MB"
 
@@ -314,8 +315,7 @@ async def process_file_message_async(
     storage_dir = Path(settings.local_storage_dir) / message_id
     target_path = storage_dir / safe_name
     progress_message_id: str | None = None
-    progress_state = {"completed": 0, "total": 0, "phase": "download"}
-    progress_log: list[str] = []
+    progress_state = {"phase": "download"}
     last_progress_patch = 0.0
 
     async def patch_progress(
@@ -339,9 +339,6 @@ async def process_file_message_async(
                     status=body or status,
                     file_name=safe_name,
                     phase=progress_state["phase"],
-                    completed=progress_state["completed"],
-                    total=progress_state["total"],
-                    recent_lines=progress_log[:-1] if not body and len(progress_log) > 1 else None,
                 ),
             )
         except Exception:
@@ -351,20 +348,10 @@ async def process_file_message_async(
 
     async def notify(text: str, *, force: bool = False) -> None:
         """进度更新：有进度卡时只 PATCH 卡片，避免刷屏 reply_text。"""
-        chunk_match = re.search(r"片段 (\d+)/(\d+)", text)
-        if chunk_match:
-            progress_state["completed"] = int(chunk_match.group(1))
-            progress_state["total"] = int(chunk_match.group(2))
-        elif "分层归并" in text or "合成最终" in text:
-            if progress_state["total"]:
-                progress_state["completed"] = progress_state["total"]
-
         status_line = text.strip().splitlines()[0] if text.strip() else text
         phase = infer_summary_progress_phase(text)
         if phase is not None:
             progress_state["phase"] = phase
-        if status_line and (not progress_log or progress_log[-1] != status_line):
-            progress_log.append(status_line)
 
         if progress_message_id:
             is_error = text.startswith(("无法处理", "处理停止", "处理失败"))
@@ -405,8 +392,6 @@ async def process_file_message_async(
             progress_message_id = await client.reply_card(message_id, card)
         if not progress_message_id:
             logger.warning("failed to create progress card for %s", message_id)
-        else:
-            progress_log.append("正在下载文件…")
 
     try:
         task_store.create_task(
@@ -697,14 +682,15 @@ async def process_file_message_async(
             )
             await patch_progress("分析完成，报告已发送。", force=True)
             progress_state["phase"] = "report"
-            progress_log.append("分析完成，报告已发送。")
-            if sender_id:
-                await client.send_card(
-                    sender_id,
-                    build_summary_complete_card(hint=hint),
-                )
-            else:
-                await notify(hint)
+            _, registry = create_skill_router(settings)
+            await client.reply_card(
+                message_id,
+                build_summary_complete_card(
+                    hint=hint,
+                    file_id=entry_key,
+                    buttons=registry.next_step_buttons(),
+                ),
+            )
     except httpx.ReadTimeout:
         logger.exception("LLM timeout while processing file message %s", message_id)
         task_store.update_task(

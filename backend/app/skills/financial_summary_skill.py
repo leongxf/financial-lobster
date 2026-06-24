@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from app.services.cards import (
-    build_file_upload_prompt_card,
-    build_next_step_card,
-)
+from app.services.cards import build_file_upload_prompt_card
 from app.skills.base import SkillButton, SkillContext
 
 
@@ -47,7 +44,6 @@ class FinancialSummarySkill:
                 sender_id=operator_id,
                 file_size=args.get("file_size"),
             )
-            await _maybe_send_next_step(ctx, operator_id, message_id)
             return
 
         if not operator_id:
@@ -105,22 +101,4 @@ class FinancialSummarySkill:
             sender_id=msg.sender_id,
             file_size=msg.file_size,
         )
-        await _maybe_send_next_step(ctx, msg.sender_id, msg.message_id)
         return False
-
-
-async def _maybe_send_next_step(
-    ctx: SkillContext,
-    operator_id: str | None,
-    message_id: str | None,
-) -> None:
-    if not operator_id or not message_id or not ctx.registry:
-        return
-    files = ctx.conversation_store.list_files(operator_id)
-    if not files:
-        return
-    entry_key = files[0].get("entry_key") or files[0].get("file_id")
-    if not entry_key:
-        return
-    card = build_next_step_card(entry_key, ctx.registry.next_step_buttons())
-    await ctx.client.reply_card(message_id, card)
