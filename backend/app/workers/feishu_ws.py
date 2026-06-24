@@ -38,6 +38,7 @@ from app.services.llm_provider import (
     LLMProvider,
     TokenUsage,
     build_chat_provider,
+    format_model_switch_status,
 )
 from app.services.markdown_report import build_parse_preview_report
 from app.services.qa_service import (
@@ -525,9 +526,13 @@ async def process_file_message_async(
         cache_hits = 0
         cache_misses = 0
         if settings.llm_api_key:
+            async def on_model_switch(from_model: str, to_model: str) -> None:
+                await notify(format_model_switch_status(from_model, to_model), force=True)
+
             provider = build_chat_provider(
                 build_chat_llm_config(settings),
                 settings.fallback_models,
+                on_model_switch=on_model_switch,
             )
             task_store.update_task(
                 task_id,
@@ -875,9 +880,13 @@ async def process_question_async(
         return
 
     try:
+        async def on_model_switch(from_model: str, to_model: str) -> None:
+            await notify(format_model_switch_status(from_model, to_model))
+
         provider = build_chat_provider(
             build_chat_llm_config(settings),
             settings.fallback_models,
+            on_model_switch=on_model_switch,
         )
         history = conversation_store.recent_history(
             sender_id, file_id, max_turns=settings.qa_history_max_turns

@@ -14,7 +14,7 @@ from app.services.industry_research import (
     run_research_from_profile,
     run_research_with_source,
 )
-from app.services.llm_provider import LLMConfig, build_chat_provider
+from app.services.llm_provider import LLMConfig, build_chat_provider, format_model_switch_status
 from app.services.qa_service import load_pages
 from app.services.templates import list_research_templates, resolve_template_path
 from app.skills.base import SkillButton, SkillContext
@@ -172,6 +172,12 @@ class IndustryResearchSkill:
             await ctx.client.send_text(operator_id, "未配置 LLM_API_KEY，无法执行行业研究。")
             return
 
+        async def notify(text: str) -> None:
+            await ctx.client.send_text(operator_id, text)
+
+        async def on_model_switch(from_model: str, to_model: str) -> None:
+            await notify(format_model_switch_status(from_model, to_model))
+
         provider = build_chat_provider(
             LLMConfig(
                 provider=ctx.settings.llm_provider,
@@ -183,6 +189,7 @@ class IndustryResearchSkill:
                 temperature=ctx.settings.llm_temperature,
             ),
             ctx.settings.fallback_models,
+            on_model_switch=on_model_switch,
         )
         web_search = ctx.tools.get("web_search")
 
@@ -190,9 +197,6 @@ class IndustryResearchSkill:
         storage_dir.mkdir(parents=True, exist_ok=True)
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", args.get("company") or "report")
         output_path = storage_dir / f"{safe_name}_industry_research.docx"
-
-        async def notify(text: str) -> None:
-            await ctx.client.send_text(operator_id, text)
 
         file_id = args.get("file_id")
         company = args.get("company")

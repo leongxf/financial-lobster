@@ -242,11 +242,21 @@ class TemplateRewriteSkill:
         source_text: str,
         template_name: str,
     ) -> None:
-        from app.services.llm_provider import LLMConfig, build_chat_provider
+        from app.services.llm_provider import (
+            LLMConfig,
+            build_chat_provider,
+            format_model_switch_status,
+        )
 
         if not ctx.settings.llm_api_key:
             await ctx.client.send_text(operator_id, "未配置 LLM_API_KEY，无法改写。")
             return
+
+        async def notify(text: str) -> None:
+            await ctx.client.send_text(operator_id, text)
+
+        async def on_model_switch(from_model: str, to_model: str) -> None:
+            await notify(format_model_switch_status(from_model, to_model))
 
         provider = build_chat_provider(
             LLMConfig(
@@ -259,10 +269,8 @@ class TemplateRewriteSkill:
                 temperature=ctx.settings.llm_temperature,
             ),
             ctx.settings.fallback_models,
+            on_model_switch=on_model_switch,
         )
-
-        async def notify(text: str) -> None:
-            await ctx.client.send_text(operator_id, text)
 
         await notify("[1/4] 解析模板结构…")
         outline = extract_template_outline(template_path)

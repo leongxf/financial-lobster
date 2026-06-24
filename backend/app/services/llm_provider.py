@@ -1,11 +1,18 @@
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+ModelSwitchCallback = Callable[[str, str], Awaitable[None]]
+
+
+def format_model_switch_status(from_model: str, to_model: str) -> str:
+    return f"模型 {from_model} 额度耗尽，已切换至 {to_model} 继续..."
 
 # 续写指令：上文因长度被截断时，要求模型从中断处接着输出且不重复已有内容，便于各轮直接拼接。
 _CONTINUE_PROMPT = (
@@ -435,7 +442,13 @@ class FallbackProvider(LLMProvider):
     备用模型列表为空时不会构造本类（见 build_chat_provider），退化为单模型：额度耗尽即报错。
     """
 
-    def __init__(self, base_config: LLMConfig, fallback_models: list[str]) -> None:
+    def __init__(
+        self,
+        base_config: LLMConfig,
+        fallback_models: list[str],
+        *,
+        on_model_switch: ModelSwitchCallback | None = None,
+    ) -> None:
         seen = {base_config.model}
         configs = [base_config]
         for model in fallback_models:
@@ -443,6 +456,7 @@ class FallbackProvider(LLMProvider):
                 seen.add(model)
                 configs.append(replace(base_config, model=model))
         self._providers = [LLMProvider(config) for config in configs]
+        self._on_model_switch = on_model_switch
         # 游标只前进不回退：已知耗尽的模型不再重撞（map 阶段并发，故加锁保护推进）。
         self._cursor = 0
         self._lock = asyncio.Lock()
@@ -464,13 +478,25 @@ class FallbackProvider(LLMProvider):
                 last_error = exc
                 has_next = index + 1 < len(self._providers)
                 if exc.category == "billing" and has_next:
+                    from_model = self._providers[index].config.model
+                    to_model = self._providers[index + 1].config.model
                     async with self._lock:
+                        old_cursor = self._cursor
                         self._cursor = max(self._cursor, index + 1)
+                        should_notify = self._cursor > old_cursor
                     logger.warning(
                         "模型 %s 额度耗尽，切换到备用模型 %s",
-                        self._providers[index].config.model,
-                        self._providers[index + 1].config.model,
+                        from_model,
+                        to_model,
                     )
+                    if should_notify and self._on_model_switch:
+                        try:
+                            await self._on_model_switch(from_model, to_model)
+                        except Exception:
+                            logger.warning(
+                                "on_model_switch callback failed",
+                                exc_info=True,
+                            )
                     continue
                 raise
         assert last_error is not None
@@ -480,10 +506,16 @@ class FallbackProvider(LLMProvider):
 def build_chat_provider(
     base_config: LLMConfig,
     fallback_models: list[str],
+    *,
+    on_model_switch: ModelSwitchCallback | None = None,
 ) -> LLMProvider:
     """有备用模型则返回带额度切换的 FallbackProvider，否则返回单模型 LLMProvider。"""
     if fallback_models:
-        return FallbackProvider(base_config, fallback_models)
+        return FallbackProvider(
+            base_config,
+            fallback_models,
+            on_model_switch=on_model_switch,
+        )
     return LLMProvider(base_config)
 
 
