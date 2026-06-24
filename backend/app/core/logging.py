@@ -7,7 +7,8 @@ from pythonjsonlogger import jsonlogger
 def configure_logging(level: str = "INFO") -> None:
     handler = logging.StreamHandler(sys.stdout)
     formatter = jsonlogger.JsonFormatter(
-        "%(asctime)s %(levelname)s %(name)s %(message)s"
+        "%(asctime)s %(levelname)s %(name)s %(message)s",
+        json_ensure_ascii=False,
     )
     handler.setFormatter(formatter)
 
